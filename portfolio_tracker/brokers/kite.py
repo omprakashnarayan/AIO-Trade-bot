@@ -99,6 +99,7 @@ class KiteAdapter(ConfiguredAdapter):
 
     def cancel_order(self, broker_order_id: str) -> OrderReceipt:
         self._require_id(broker_order_id)
+        self._assert_token_valid()
         raise LiveExecutionDisabled(self.provider_name)
 
     def order_status(self, broker_order_id: str) -> OrderReceipt:

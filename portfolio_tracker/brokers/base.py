@@ -214,6 +214,7 @@ class ConfiguredAdapter:
 
     def _call(self, operation: str, payload: Mapping[str, Any], *, write: bool = False) -> Mapping[str, Any]:
         if write:
+            self._assert_token_valid()
             raise LiveExecutionDisabled(self.provider_name)
         if self._transport is None:
             raise BrokerAdapterError("transport_unconfigured", "no injectable transport is configured", provider=self.provider_name)
@@ -262,6 +263,9 @@ class ConfiguredAdapter:
         require_intent(intent)
         if intent.mode.value == "paper":
             raise BrokerAdapterError("paper_requires_gateway", "route PAPER intents through ExecutionGateway/PaperBroker", provider=self.provider_name)
+        if intent.account_id != self._account_id:
+            raise BrokerAdapterError("account_mismatch", "order account does not match adapter account", provider=self.provider_name)
+        self._assert_token_valid()
         raise LiveExecutionDisabled(self.provider_name)
 
     @staticmethod

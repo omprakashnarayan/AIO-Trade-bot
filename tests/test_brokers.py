@@ -66,6 +66,52 @@ def test_paper_intent_must_stay_on_gateway_even_when_adapter_has_transport():
     assert calls == []
 
 
+def test_account_scope_is_checked_before_live_disabled():
+    adapter = KiteAdapter(KiteConfig(account_id="acct", api_key="key"))
+    with pytest.raises(BrokerAdapterError) as error:
+        adapter.submit_order(intent(account_id="other"))
+    assert error.value.code == "account_mismatch"
+
+
+def test_expired_token_is_checked_before_live_disabled():
+    expired = datetime.now(timezone.utc) - timedelta(minutes=1)
+    adapter = KiteAdapter(KiteConfig(account_id="acct", api_key="key", access_token="token",
+                                     token_expires_at=expired))
+    with pytest.raises(BrokerAdapterError) as error:
+        adapter.submit_order(intent())
+    assert error.value.code == "token_expired"
+
+
+def test_runtime_token_expiry_blocks_submit_and_cancel(monkeypatch):
+    from portfolio_tracker.brokers import base
+
+    expiry = datetime(2030, 1, 1, tzinfo=timezone.utc)
+    adapter = KiteAdapter(KiteConfig(account_id="acct", api_key="key", access_token="token",
+                                     token_expires_at=expiry))
+    monkeypatch.setattr(base, "utc_now", lambda: expiry)
+    with pytest.raises(BrokerAdapterError, match="expired"):
+        adapter.submit_order(intent())
+    with pytest.raises(BrokerAdapterError, match="expired"):
+        adapter.cancel_order("x")
+    with pytest.raises(BrokerAdapterError, match="expired"):
+        adapter._call("submit_order", {}, write=True)
+
+
+def test_cancel_requires_order_id_before_live_disabled():
+    adapter = KiteAdapter(KiteConfig(account_id="acct", api_key="key"))
+    with pytest.raises(BrokerAdapterError) as error:
+        adapter.cancel_order("")
+    assert error.value.code == "invalid_request"
+
+
+def test_order_response_requires_order_id():
+    adapter = KiteAdapter(KiteConfig(account_id="acct", api_key="key"),
+                          transport=lambda operation, payload: {"data": {"status": "open"}})
+    with pytest.raises(BrokerAdapterError, match="no order ID") as error:
+        adapter.order_status("x")
+    assert error.value.code == "invalid_response"
+
+
 def test_kite_payload_mapping_is_preserved_without_a_live_write_path():
     adapter = KiteAdapter(KiteConfig(account_id="acct", api_key="key", access_token="token", live_enabled=True,
                                      exchange_symbols={"NSE:INFY": "NSE:INFY"}))
