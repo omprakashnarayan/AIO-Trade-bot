@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import sqlite3
 from dataclasses import dataclass
@@ -71,6 +72,11 @@ CREATE TABLE IF NOT EXISTS audit_events (
 CREATE INDEX IF NOT EXISTS idx_audit_events_entity ON audit_events(entity_type, entity_id, id);
 CREATE TRIGGER IF NOT EXISTS audit_events_no_update BEFORE UPDATE ON audit_events BEGIN SELECT RAISE(ABORT, 'audit_events is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS audit_events_no_delete BEFORE DELETE ON audit_events BEGIN SELECT RAISE(ABORT, 'audit_events is append-only'); END;
+CREATE TABLE IF NOT EXISTS paper_holdings (
+    portfolio TEXT NOT NULL, symbol TEXT NOT NULL, currency TEXT NOT NULL,
+    shares TEXT NOT NULL CHECK (length(shares) > 0), avg_cost TEXT NOT NULL CHECK (length(avg_cost) > 0),
+    updated_at TEXT NOT NULL, PRIMARY KEY (portfolio, symbol)
+);
 """
 
 
@@ -402,6 +408,16 @@ class Database:
         with self.connect() as conn:
             return conn.execute("SELECT * FROM order_intents WHERE id=?" if order_id is not None else "SELECT * FROM order_intents WHERE idempotency_key=?", (order_id if order_id is not None else idempotency_key,)).fetchone()
 
+    @staticmethod
+    def paper_order_key(broker_id: str, account_id: str | None, portfolio_id: str | None, idempotency_key: str) -> str:
+        namespace = "\x1f".join((broker_id, account_id or "", portfolio_id or "", idempotency_key))
+        return "paper-" + hashlib.sha256(namespace.encode("utf-8")).hexdigest()
+
+    def get_scoped_order_intent(self, *, broker_id: str, account_id: str | None, portfolio_id: str | None, idempotency_key: str) -> sqlite3.Row | None:
+        storage_key = self.paper_order_key(broker_id, account_id, portfolio_id, idempotency_key)
+        with self.connect() as conn:
+            return conn.execute("SELECT * FROM order_intents WHERE broker_id=? AND account_id IS ? AND portfolio_id IS ? AND idempotency_key=?", (broker_id, account_id, portfolio_id, storage_key)).fetchone()
+
     def list_order_intents(self, status: str | None = None) -> list[sqlite3.Row]:
         if status is not None and status not in _ORDER_STATUSES:
             raise ValueError(f"status must be one of: {', '.join(sorted(_ORDER_STATUSES))}")
@@ -533,6 +549,64 @@ class Database:
             conn.execute("INSERT INTO holdings(portfolio, symbol, label, currency, shares, avg_cost, notes, updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(portfolio, symbol) DO UPDATE SET label=excluded.label, currency=excluded.currency, shares=excluded.shares, avg_cost=excluded.avg_cost, notes=excluded.notes, updated_at=excluded.updated_at", (portfolio, symbol, row["label"] if row else "", currency, float(new_shares), float(new_avg), row["notes"] if row else notes, datetime.now(timezone.utc).isoformat()))
             conn.execute("INSERT INTO transactions(portfolio, symbol, side, shares, price, currency, fees, trade_date, notes) VALUES(?,?,?,?,?,?,?,?,?)", (portfolio, symbol, side, float(delta), float(price), currency, float(fee), trade_date or datetime.now(timezone.utc).date().isoformat(), notes))
             conn.commit()
+
+    def get_paper_holding(self, *, portfolio: str, symbol: str) -> sqlite3.Row | None:
+        with self.connect() as conn:
+            return conn.execute("SELECT * FROM paper_holdings WHERE portfolio=? AND symbol=?", (portfolio, symbol)).fetchone()
+
+    def execute_paper_submission(self, *, intent: OrderIntent, broker_id: str, quantity: Decimal, fill_price: Decimal, fee: Decimal, total: Decimal, now: str, fill_id: str, reason: str | None = None, audit_callback=None) -> dict[str, Any]:
+        account_id = intent.account_id or ""
+        portfolio_id = intent.portfolio_id if intent.portfolio_id is not None else ""
+        storage_key = self.paper_order_key(broker_id, intent.account_id, intent.portfolio_id, intent.idempotency_key)
+        payload = _canonical_json(intent.to_dict(), "order payload")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM order_intents WHERE broker_id=? AND account_id IS ? AND portfolio_id IS ? AND idempotency_key=?", (broker_id, intent.account_id, intent.portfolio_id, storage_key)).fetchone()
+            if row is not None:
+                if audit_callback:
+                    audit_callback(conn, "order.retry", "order_intent", str(row["id"]), intent, {"reused": True}, now)
+                self._append_audit_event_conn(conn, "order.retry", "order_intent", str(row["id"]), {"intent": intent.to_dict(), "reused": True}, broker_id, intent.account_id, intent.portfolio_id, intent.mode.value, now)
+                return {"order_id": row["id"], "status": row["status"], "reused": True, "cash": self._cash_in_conn(conn, intent.currency, account_id, portfolio_id), "fill": conn.execute("SELECT * FROM fills WHERE order_id=? ORDER BY id LIMIT 1", (row["id"],)).fetchone()}
+            cur = conn.execute("INSERT INTO order_intents(broker_id, account_id, portfolio_id, mode, idempotency_key, order_payload, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (broker_id, intent.account_id, intent.portfolio_id, intent.mode.value, storage_key, payload, "rejected" if reason else "accepted", now, now))
+            order_id = int(cur.lastrowid)
+            cash = self._cash_in_conn(conn, intent.currency, account_id, portfolio_id)
+            if reason:
+                if audit_callback:
+                    audit_callback(conn, "order.rejected", "order_intent", str(order_id), intent, {"reason": reason}, now)
+                self._append_audit_event_conn(conn, "order.rejected", "order_intent", str(order_id), {"intent": intent.to_dict(), "reason": reason}, broker_id, intent.account_id, intent.portfolio_id, intent.mode.value, now)
+                return {"order_id": order_id, "status": "rejected", "reused": False, "cash": cash, "fill": None}
+            is_buy = str(intent.side) == "buy"
+            new_cash = cash - total if is_buy else cash + total
+            balance_text = _canonical_decimal(new_cash, "balance", nonnegative=True)
+            conn.execute("INSERT INTO cash_balances(account_id, portfolio_id, currency, balance, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(account_id, portfolio_id, currency) DO UPDATE SET balance=excluded.balance, updated_at=excluded.updated_at", (account_id, portfolio_id, _currency(intent.currency), balance_text, now))
+            amount = -total if is_buy else total
+            conn.execute("INSERT INTO cash_ledger(account_id, portfolio_id, currency, amount, balance_after, entry_type, reference_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (account_id, portfolio_id, _currency(intent.currency), _canonical_decimal(amount, "amount"), balance_text, "trade", str(order_id), now))
+            holding = conn.execute("SELECT shares, avg_cost FROM paper_holdings WHERE portfolio=? AND symbol=?", (portfolio_id, intent.symbol)).fetchone()
+            owned = Decimal(holding["shares"]) if holding else Decimal("0")
+            old_avg = Decimal(holding["avg_cost"]) if holding else Decimal("0")
+            new_shares = owned + quantity if is_buy else owned - quantity
+            new_avg = ((owned * old_avg) + (quantity * fill_price) + fee) / new_shares if is_buy else (old_avg if new_shares else Decimal("0"))
+            new_avg = new_avg.quantize(Decimal("0.000000000000000001"))
+            shares_text, avg_text = _canonical_decimal(new_shares, "shares", nonnegative=True), _canonical_decimal(new_avg, "avg_cost", nonnegative=True)
+            conn.execute("INSERT INTO paper_holdings(portfolio, symbol, currency, shares, avg_cost, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(portfolio, symbol) DO UPDATE SET currency=excluded.currency, shares=excluded.shares, avg_cost=excluded.avg_cost, updated_at=excluded.updated_at", (portfolio_id, intent.symbol, _currency(intent.currency), shares_text, avg_text, now))
+            conn.execute("INSERT INTO holdings(portfolio, symbol, label, currency, shares, avg_cost, notes, updated_at) VALUES (?, ?, '', ?, ?, ?, '', ?) ON CONFLICT(portfolio, symbol) DO UPDATE SET shares=excluded.shares, avg_cost=excluded.avg_cost, currency=excluded.currency, updated_at=excluded.updated_at", (portfolio_id, intent.symbol, _currency(intent.currency), float(new_shares), float(new_avg), now))
+            conn.execute("INSERT INTO transactions(portfolio, symbol, side, shares, price, currency, fees, trade_date, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (portfolio_id, intent.symbol, str(intent.side), float(quantity), float(fill_price), _currency(intent.currency), float(fee), now[:10], "paper broker"))
+            execution = {"fee": _canonical_decimal(fee, "fee", nonnegative=True), "total": _canonical_decimal(total, "total", nonnegative=True)}
+            conn.execute("INSERT INTO fills(order_id, broker_id, account_id, external_fill_id, quantity, price, currency, execution_payload, filled_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (order_id, broker_id, account_id, fill_id, _canonical_decimal(quantity, "fill quantity", positive=True), _canonical_decimal(fill_price, "fill price", positive=True), _currency(intent.currency), _canonical_json(execution, "execution payload"), now, now))
+            conn.execute("UPDATE order_intents SET status='filled', updated_at=? WHERE id=?", (now, order_id))
+            if audit_callback:
+                audit_callback(conn, "order.filled", "order_intent", str(order_id), intent, {"fill_id": fill_id, "total": execution["total"]}, now)
+            self._append_audit_event_conn(conn, "order.filled", "order_intent", str(order_id), {"intent": intent.to_dict(), "fill_id": fill_id, "total": execution["total"]}, broker_id, intent.account_id, intent.portfolio_id, intent.mode.value, now)
+            return {"order_id": order_id, "status": "filled", "reused": False, "cash": new_cash, "fill": conn.execute("SELECT * FROM fills WHERE id=last_insert_rowid()").fetchone()}
+
+    @staticmethod
+    def _cash_in_conn(conn: sqlite3.Connection, currency: str, account_id: str, portfolio_id: str) -> Decimal:
+        row = conn.execute("SELECT balance FROM cash_balances WHERE account_id=? AND portfolio_id=? AND currency=?", (account_id, portfolio_id, _currency(currency))).fetchone()
+        return Decimal(row["balance"]) if row else Decimal("0")
+
+    @staticmethod
+    def _append_audit_event_conn(conn: sqlite3.Connection, event_type: str, entity_type: str, entity_id: str, payload: Any, broker_id: str | None, account_id: str | None, portfolio_id: str | None, mode: str | None, occurred_at: str) -> None:
+        conn.execute("INSERT INTO audit_events(event_type, entity_type, entity_id, broker_id, account_id, portfolio_id, mode, payload, occurred_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (event_type, entity_type, entity_id, broker_id, account_id, portfolio_id, mode, _canonical_json(payload, "audit payload"), occurred_at, occurred_at))
 
     def list_holdings(self, portfolio: str | None = None) -> list[sqlite3.Row]:
         with self.connect() as conn: return conn.execute("SELECT * FROM holdings" + (" WHERE portfolio=?" if portfolio else "") + " ORDER BY portfolio, symbol", (portfolio,) if portfolio else ()).fetchall()

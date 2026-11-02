@@ -68,3 +68,58 @@ def test_atomic_failure_rolls_back_all_state(tmp_path, monkeypatch):
     assert b.db.list_fills() == []
     assert b.db.list_cash_ledger() == []
     assert b.db.get_cash_balance(currency="INR", account_id="acct", portfolio_id="p1")["balance"] == "10000"
+
+
+def test_account_only_uses_empty_portfolio_scope(tmp_path):
+    b = PaperBroker(Database(tmp_path / "db.sqlite"))
+    b.seed_cash("1000", currency="INR", account_id="acct")
+    result = b.submit(intent("account-only", qty="1", portfolio=None), price="100")
+    assert result.filled
+    assert b.db.get_cash_balance(currency="INR", account_id="acct", portfolio_id="")["balance"] == "900.000000000000000000"
+    assert b.db.get_cash_balance(currency="INR", account_id="acct", portfolio_id="p1") is None
+    assert b.db.get_paper_holding(portfolio="", symbol="INFY")["shares"] == "1"
+
+
+def test_broker_identity_isolation(tmp_path):
+    db = Database(tmp_path / "db.sqlite")
+    first = PaperBroker(db, broker_id="broker-a")
+    second = PaperBroker(db, broker_id="broker-b")
+    first.seed_cash("1000", currency="INR", account_id="acct", portfolio_id="p1")
+    second.seed_cash("1000", currency="INR", account_id="acct", portfolio_id="p1")
+    one = first.submit(intent("same"), price="100")
+    two = second.submit(intent("same"), price="200")
+    assert one.order_id != two.order_id
+    assert not two.reused
+    assert len(db.list_order_intents()) == 2
+
+
+def test_retry_appends_audit_without_mutating_trade_state(tmp_path):
+    b = broker(tmp_path)
+    b.submit(intent(), price="100")
+    before = (len(b.db.list_fills()), len(b.db.list_cash_ledger()), len(b.db.list_holdings()))
+    b.submit(intent(), price="999")
+    after = (len(b.db.list_fills()), len(b.db.list_cash_ledger()), len(b.db.list_holdings()))
+    events = b.db.list_audit_events(entity_type="order_intent")
+    assert before == after
+    assert [event["event_type"] for event in events] == ["order.filled", "order.retry"]
+
+
+def test_decimal_precision_is_kept_in_paper_state(tmp_path):
+    b = broker(tmp_path)
+    b.submit(intent(qty="0.123456789123456789"), price="100.123456789123456789")
+    row = b.db.get_paper_holding(portfolio="p1", symbol="INFY")
+    assert row["shares"] == "0.123456789123456789"
+    assert row["avg_cost"] == "100.123456789123456789"
+
+
+def test_max_idempotency_key_has_bounded_fill_id(tmp_path):
+    b = broker(tmp_path)
+    key = "k" * 128
+    result = b.submit(intent(key), price="100")
+    assert len(result.fill.fill_id) <= 128
+    assert result.fill.fill_id == b.submit(intent(key), price="999").fill.fill_id
+
+
+def test_invalid_slippage_multiplier_rejected(tmp_path):
+    with pytest.raises(ValueError, match="slippage_bps"):
+        PaperBroker(Database(tmp_path / "db.sqlite"), slippage_bps="10000")
