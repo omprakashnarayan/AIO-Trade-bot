@@ -11,6 +11,7 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 from typing import Any
+import unicodedata
 
 
 class _ValueEnum(str, Enum):
@@ -50,6 +51,9 @@ class TimeInForce(_ValueEnum):
 
 _ALLOWED_CURRENCIES = frozenset({"USD", "INR"})
 _MAX_IDENTIFIER_LENGTH = 128
+_MAX_DECIMAL_DIGITS = 38
+_MAX_DECIMAL_EXPONENT = 18
+_MAX_DECIMAL_SERIALIZED_LENGTH = 64
 
 
 def _required_text(value: str, field_name: str) -> str:
@@ -64,11 +68,18 @@ def _required_text(value: str, field_name: str) -> str:
 def _identifier(value: str, field_name: str) -> str:
     if not isinstance(value, str):
         raise TypeError(f"{field_name} must be a string")
-    if any(ord(character) < 32 or ord(character) == 127 for character in value):
-        raise ValueError(f"{field_name} must not contain control characters")
     result = value.strip()
     if not result:
         raise ValueError(f"{field_name} must be non-empty")
+    if any(unicodedata.category(character) in {"Cc", "Cf", "Cs"} or unicodedata.category(character).startswith("Z") for character in result):
+        raise ValueError(f"{field_name} must not contain control, format, or separator characters")
+    if len(result) > _MAX_IDENTIFIER_LENGTH:
+        raise ValueError(f"{field_name} must be at most {_MAX_IDENTIFIER_LENGTH} characters")
+    return result
+
+
+def _symbol(value: str, field_name: str) -> str:
+    result = unicodedata.normalize("NFKC", _identifier(value, field_name)).upper()
     if len(result) > _MAX_IDENTIFIER_LENGTH:
         raise ValueError(f"{field_name} must be at most {_MAX_IDENTIFIER_LENGTH} characters")
     return result
@@ -95,6 +106,11 @@ def _decimal(value: Decimal | int | str, field_name: str, *, positive: bool = Fa
         raise TypeError(f"{field_name} must be a Decimal-compatible number") from exc
     if not result.is_finite():
         raise ValueError(f"{field_name} must be finite")
+    sign, digits, exponent = result.as_tuple()
+    if len(digits) > _MAX_DECIMAL_DIGITS or abs(exponent) > _MAX_DECIMAL_EXPONENT:
+        raise ValueError(f"{field_name} is outside the supported numeric range")
+    if len(format(result, "f")) > _MAX_DECIMAL_SERIALIZED_LENGTH:
+        raise ValueError(f"{field_name} serialization is too large")
     if positive and result <= 0:
         raise ValueError(f"{field_name} must be positive")
     return result
@@ -142,7 +158,7 @@ class OrderIntent:
             raise ValueError("portfolio_id or account_id is required")
         object.__setattr__(self, "portfolio_id", portfolio_id)
         object.__setattr__(self, "account_id", account_id)
-        symbol = _identifier(self.symbol, "symbol").upper()
+        symbol = _symbol(self.symbol, "symbol")
         object.__setattr__(self, "symbol", symbol)
         object.__setattr__(self, "side", _enum(self.side, OrderSide, "side"))
         object.__setattr__(self, "order_type", _enum(self.order_type, OrderType, "order_type"))
@@ -199,7 +215,7 @@ class TradeProposal:
     expires_at: datetime
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "proposal_id", _required_text(self.proposal_id, "proposal_id"))
+        object.__setattr__(self, "proposal_id", _identifier(self.proposal_id, "proposal_id"))
         if not isinstance(self.intent, OrderIntent):
             raise TypeError("intent must be an OrderIntent")
         object.__setattr__(self, "strategy", _required_text(self.strategy, "strategy"))

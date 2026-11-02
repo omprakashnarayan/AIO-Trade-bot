@@ -155,6 +155,63 @@ def test_broker_symbols_with_dot_and_exchange_prefix_are_preserved():
     assert make_intent(symbol="nse:reliance").symbol == "NSE:RELIANCE"
 
 
+@pytest.mark.parametrize("value", ["bad\u200bvalue", "bad\u2060value", "bad\u2028value"])
+def test_identifiers_reject_unicode_format_and_separator_characters(value):
+    with pytest.raises(ValueError):
+        make_intent(idempotency_key=value)
+
+
+def test_symbol_case_expansion_is_bounded_after_normalization():
+    with pytest.raises(ValueError):
+        make_intent(symbol="ß" * 65)
+
+
+@pytest.mark.parametrize("value", [Decimal("1e19"), Decimal("1e-19"), Decimal("9" * 39)])
+def test_decimal_values_are_bounded_for_precision_and_exponent(value):
+    with pytest.raises(ValueError):
+        make_intent(quantity=value)
+
+
+@pytest.mark.parametrize("value", ["", "  ", "bad\nvalue", "x" * 129])
+def test_trade_proposal_id_uses_bounded_identifier_validation(value):
+    with pytest.raises((TypeError, ValueError)):
+        TradeProposal(
+            proposal_id=value,
+            intent=make_intent(),
+            strategy="mean-reversion-v1",
+            rationale="Test proposal",
+            expires_at=datetime(2026, 11, 2, 12, 0, tzinfo=timezone.utc),
+        )
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("fill_id", ""),
+        ("fill_id", "  "),
+        ("fill_id", "bad\nvalue"),
+        ("fill_id", "x" * 129),
+        ("intent_idempotency_key", ""),
+        ("quantity", Decimal("0")),
+        ("price", Decimal("-1")),
+        ("currency", "EUR"),
+        ("filled_at", datetime(2026, 11, 2, 12, 0)),
+    ],
+)
+def test_invalid_fill_values_are_rejected(field, value):
+    values = {
+        "fill_id": "fill-001",
+        "intent_idempotency_key": "intent-001",
+        "quantity": Decimal("2"),
+        "price": Decimal("1500.25"),
+        "currency": "INR",
+        "filled_at": datetime(2026, 11, 2, 12, 0, tzinfo=timezone.utc),
+    }
+    values[field] = value
+    with pytest.raises((TypeError, ValueError)):
+        Fill(**values)
+
+
 def test_asset_class_is_serialized():
     assert make_intent(asset_class=AssetClass.EQUITY).to_dict()["asset_class"] == "equity"
 
