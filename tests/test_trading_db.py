@@ -51,6 +51,35 @@ def test_init_db_recreates_missing_required_index_without_losing_data(tmp_path):
     assert "idx_order_intents_status" in indexes
 
 
+def test_init_db_rebuilds_order_intents_with_incomplete_status_check(tmp_path):
+    path = tmp_path / "legacy-status-check.sqlite3"
+    with sqlite3.connect(path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE order_intents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, broker_id TEXT NOT NULL, account_id TEXT, portfolio_id TEXT,
+                mode TEXT NOT NULL CHECK (mode IN ('paper', 'live')), idempotency_key TEXT NOT NULL UNIQUE,
+                order_payload TEXT NOT NULL CHECK (length(order_payload) > 0),
+                status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','filled')),
+                external_order_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                CHECK (account_id IS NOT NULL OR portfolio_id IS NOT NULL)
+            );
+            CREATE INDEX idx_order_intents_account_created ON order_intents(account_id, created_at);
+            CREATE INDEX idx_order_intents_status ON order_intents(status);
+            INSERT INTO order_intents VALUES (1, 'kite', 'kite-account', NULL, 'paper', 'legacy-status', '{}', 'pending', NULL, '2026-11-02T00:00:00+00:00', '2026-11-02T00:00:00+00:00');
+            """
+        )
+
+    db = Database(path)
+    db.init_db()
+
+    assert db.get_order_intent(1)["idempotency_key"] == "legacy-status"
+    with db.connect() as conn:
+        sql = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='order_intents'").fetchone()[0].lower()
+    assert all(status in sql for status in ("pending", "submitted", "accepted", "partially_filled", "filled", "canceled", "rejected", "failed"))
+    assert db.insert_order_intent(make_intent("post-status-migration"), status="accepted") > 1
+
+
 def test_init_db_migrates_legacy_tables_without_losing_existing_data(tmp_path):
     path = tmp_path / "legacy.sqlite3"
     with sqlite3.connect(path) as conn:

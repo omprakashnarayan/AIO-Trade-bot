@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -197,12 +198,29 @@ _EXPECTED_INDEXES = {
 }
 
 _EXPECTED_CHECKS = {
-    "order_intents": ("mode in ('paper', 'live')", "length(order_payload) > 0", "status in (", "account_id is not null or portfolio_id is not null"),
+    "order_intents": ("mode in ('paper', 'live')", "length(order_payload) > 0", "account_id is not null or portfolio_id is not null"),
     "fills": ("length(quantity) > 0", "length(price) > 0"),
     "cash_ledger": ("length(amount) > 0", "balance_after is null or length(balance_after) > 0", "account_id <> '' or portfolio_id <> ''"),
     "cash_balances": ("length(balance) > 0", "account_id <> '' or portfolio_id <> ''"),
     "audit_events": ("mode is null or mode in ('paper', 'live')", "length(payload) > 0"),
 }
+
+_STATUS_CHECK_PATTERN = re.compile(r"check\s*\(\s*status\s+in\s*\(([^()]*)\)\s*\)", re.IGNORECASE)
+
+
+def _status_check_values(sql: str) -> frozenset[str] | None:
+    matches = _STATUS_CHECK_PATTERN.findall(sql)
+    if len(matches) != 1:
+        return None
+    values = []
+    for item in matches[0].split(","):
+        match = re.fullmatch(r"\s*'((?:''|[^'])*)'\s*", item)
+        if match is None:
+            return None
+        values.append(match.group(1).replace("''", "'").lower())
+    if len(values) != len(set(values)):
+        return None
+    return frozenset(values)
 
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -237,6 +255,8 @@ def _needs_migration(conn: sqlite3.Connection, table: str) -> bool:
     if "autoincrement" not in sql:
         return True
     if any(check not in sql for check in _EXPECTED_CHECKS[table]):
+        return True
+    if table == "order_intents" and _status_check_values(sql) != _ORDER_STATUSES:
         return True
     indexes = _table_indexes(conn, table)
     for name, expected in _EXPECTED_INDEXES[table].items():
