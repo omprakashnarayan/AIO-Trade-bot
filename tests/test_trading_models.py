@@ -4,7 +4,9 @@ from decimal import Decimal
 import pytest
 
 from portfolio_tracker.trading_models import (
+    AssetClass,
     ExecutionMode,
+    Fill,
     OrderIntent,
     OrderSide,
     OrderType,
@@ -36,6 +38,7 @@ def test_valid_long_only_equity_intent_is_immutable_and_deterministic():
     assert intent.quantity == Decimal("2")
     assert intent.to_dict() == {
         "account_id": None,
+        "asset_class": "equity",
         "currency": "INR",
         "idempotency_key": "intent-001",
         "limit_price": "1500.25",
@@ -101,3 +104,75 @@ def test_account_id_is_accepted_as_explicit_identifier():
 def test_at_least_one_portfolio_or_account_identifier_is_required():
     with pytest.raises(ValueError):
         make_intent(portfolio_id=None, account_id=None)
+
+
+@pytest.mark.parametrize(
+    "order_type,limit_price,stop_price",
+    [
+        (OrderType.MARKET, None, None),
+        (OrderType.LIMIT, Decimal("10"), None),
+        (OrderType.STOP, None, Decimal("10")),
+        (OrderType.STOP_LIMIT, Decimal("10"), Decimal("9")),
+    ],
+)
+def test_each_order_type_accepts_only_its_required_prices(order_type, limit_price, stop_price):
+    intent = make_intent(order_type=order_type, limit_price=limit_price, stop_price=stop_price)
+    assert intent.order_type is order_type
+
+
+@pytest.mark.parametrize(
+    "order_type,limit_price,stop_price",
+    [
+        (OrderType.MARKET, Decimal("10"), None),
+        (OrderType.MARKET, None, Decimal("10")),
+        (OrderType.LIMIT, None, None),
+        (OrderType.LIMIT, Decimal("10"), Decimal("9")),
+        (OrderType.STOP, None, None),
+        (OrderType.STOP, Decimal("10"), Decimal("9")),
+        (OrderType.STOP_LIMIT, Decimal("10"), None),
+        (OrderType.STOP_LIMIT, None, Decimal("9")),
+    ],
+)
+def test_invalid_order_type_price_combinations_are_rejected(order_type, limit_price, stop_price):
+    with pytest.raises(ValueError):
+        make_intent(order_type=order_type, limit_price=limit_price, stop_price=stop_price)
+
+
+@pytest.mark.parametrize("field", ["idempotency_key", "portfolio_id", "account_id", "symbol"])
+@pytest.mark.parametrize("value", ["", "  ", "bad\nvalue", "x" * 129])
+def test_identifiers_are_nonempty_control_free_and_bounded(field, value):
+    overrides = {field: value}
+    if field == "portfolio_id":
+        overrides["account_id"] = "account-1"
+    if field == "account_id":
+        overrides["portfolio_id"] = None
+    with pytest.raises((TypeError, ValueError)):
+        make_intent(**overrides)
+
+
+def test_broker_symbols_with_dot_and_exchange_prefix_are_preserved():
+    assert make_intent(symbol="brk.b").symbol == "BRK.B"
+    assert make_intent(symbol="nse:reliance").symbol == "NSE:RELIANCE"
+
+
+def test_asset_class_is_serialized():
+    assert make_intent(asset_class=AssetClass.EQUITY).to_dict()["asset_class"] == "equity"
+
+
+def test_fill_validates_and_serializes():
+    fill = Fill(
+        fill_id="fill-001",
+        intent_idempotency_key="intent-001",
+        quantity=Decimal("2"),
+        price=Decimal("1500.25"),
+        currency="inr",
+        filled_at=datetime(2026, 11, 2, 12, 0, tzinfo=timezone.utc),
+    )
+    assert fill.to_dict() == {
+        "currency": "INR",
+        "fill_id": "fill-001",
+        "filled_at": "2026-11-02T12:00:00+00:00",
+        "intent_idempotency_key": "intent-001",
+        "price": "1500.25",
+        "quantity": "2",
+    }

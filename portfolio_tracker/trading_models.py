@@ -49,6 +49,7 @@ class TimeInForce(_ValueEnum):
 
 
 _ALLOWED_CURRENCIES = frozenset({"USD", "INR"})
+_MAX_IDENTIFIER_LENGTH = 128
 
 
 def _required_text(value: str, field_name: str) -> str:
@@ -60,10 +61,29 @@ def _required_text(value: str, field_name: str) -> str:
     return value
 
 
+def _identifier(value: str, field_name: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{field_name} must be a string")
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ValueError(f"{field_name} must not contain control characters")
+    result = value.strip()
+    if not result:
+        raise ValueError(f"{field_name} must be non-empty")
+    if len(result) > _MAX_IDENTIFIER_LENGTH:
+        raise ValueError(f"{field_name} must be at most {_MAX_IDENTIFIER_LENGTH} characters")
+    return result
+
+
 def _optional_text(value: str | None, field_name: str) -> str | None:
     if value is None:
         return None
     return _required_text(value, field_name)
+
+
+def _optional_identifier(value: str | None, field_name: str) -> str | None:
+    if value is None:
+        return None
+    return _identifier(value, field_name)
 
 
 def _decimal(value: Decimal | int | str, field_name: str, *, positive: bool = False) -> Decimal:
@@ -115,14 +135,14 @@ class OrderIntent:
     asset_class: AssetClass = AssetClass.EQUITY
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "idempotency_key", _required_text(self.idempotency_key, "idempotency_key"))
-        portfolio_id = _optional_text(self.portfolio_id, "portfolio_id")
-        account_id = _optional_text(self.account_id, "account_id")
+        object.__setattr__(self, "idempotency_key", _identifier(self.idempotency_key, "idempotency_key"))
+        portfolio_id = _optional_identifier(self.portfolio_id, "portfolio_id")
+        account_id = _optional_identifier(self.account_id, "account_id")
         if portfolio_id is None and account_id is None:
             raise ValueError("portfolio_id or account_id is required")
         object.__setattr__(self, "portfolio_id", portfolio_id)
         object.__setattr__(self, "account_id", account_id)
-        symbol = _required_text(self.symbol, "symbol").upper()
+        symbol = _identifier(self.symbol, "symbol").upper()
         object.__setattr__(self, "symbol", symbol)
         object.__setattr__(self, "side", _enum(self.side, OrderSide, "side"))
         object.__setattr__(self, "order_type", _enum(self.order_type, OrderType, "order_type"))
@@ -137,10 +157,21 @@ class OrderIntent:
             object.__setattr__(self, "limit_price", _decimal(self.limit_price, "limit_price", positive=True))
         if self.stop_price is not None:
             object.__setattr__(self, "stop_price", _decimal(self.stop_price, "stop_price", positive=True))
+        has_limit = self.limit_price is not None
+        has_stop = self.stop_price is not None
+        required_prices = {
+            OrderType.MARKET: (False, False),
+            OrderType.LIMIT: (True, False),
+            OrderType.STOP: (False, True),
+            OrderType.STOP_LIMIT: (True, True),
+        }[self.order_type]
+        if (has_limit, has_stop) != required_prices:
+            raise ValueError(f"price fields do not match order_type {self.order_type.value}")
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "account_id": self.account_id,
+            "asset_class": self.asset_class.value,
             "currency": self.currency,
             "idempotency_key": self.idempotency_key,
             "limit_price": _string_decimal(self.limit_price),
@@ -195,8 +226,8 @@ class Fill:
     filled_at: datetime
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "fill_id", _required_text(self.fill_id, "fill_id"))
-        object.__setattr__(self, "intent_idempotency_key", _required_text(self.intent_idempotency_key, "intent_idempotency_key"))
+        object.__setattr__(self, "fill_id", _identifier(self.fill_id, "fill_id"))
+        object.__setattr__(self, "intent_idempotency_key", _identifier(self.intent_idempotency_key, "intent_idempotency_key"))
         object.__setattr__(self, "quantity", _decimal(self.quantity, "quantity", positive=True))
         object.__setattr__(self, "price", _decimal(self.price, "price", positive=True))
         if not isinstance(self.currency, str) or self.currency.upper() not in _ALLOWED_CURRENCIES:
