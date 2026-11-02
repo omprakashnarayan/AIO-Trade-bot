@@ -34,6 +34,47 @@ def test_schema_initialization_is_idempotent(tmp_path):
     assert {"order_intents", "fills", "cash_ledger", "cash_balances", "audit_events"} <= tables
 
 
+def test_init_db_migrates_legacy_tables_without_losing_existing_data(tmp_path):
+    path = tmp_path / "legacy.sqlite3"
+    with sqlite3.connect(path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE holdings (portfolio TEXT NOT NULL, symbol TEXT NOT NULL, label TEXT, currency TEXT NOT NULL, shares REAL NOT NULL, avg_cost REAL NOT NULL, notes TEXT, updated_at TEXT NOT NULL, PRIMARY KEY (portfolio, symbol));
+            CREATE TABLE transactions (id INTEGER PRIMARY KEY AUTOINCREMENT, portfolio TEXT NOT NULL, symbol TEXT NOT NULL, side TEXT NOT NULL, shares REAL NOT NULL, price REAL NOT NULL, currency TEXT NOT NULL, fees REAL NOT NULL, trade_date TEXT NOT NULL, notes TEXT);
+            CREATE TABLE price_cache (portfolio TEXT NOT NULL, symbol TEXT NOT NULL, price REAL NOT NULL, as_of TEXT NOT NULL, source TEXT NOT NULL, PRIMARY KEY (portfolio, symbol));
+            CREATE TABLE order_intents (id INTEGER PRIMARY KEY AUTOINCREMENT, broker_id TEXT NOT NULL, account_id TEXT, portfolio_id TEXT, mode TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE, order_payload TEXT NOT NULL, status TEXT NOT NULL, external_order_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+            CREATE TABLE fills (id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER NOT NULL, external_fill_id TEXT, quantity TEXT NOT NULL, price TEXT NOT NULL, currency TEXT NOT NULL, execution_payload TEXT, filled_at TEXT NOT NULL, created_at TEXT NOT NULL);
+            CREATE TABLE cash_ledger (id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT, portfolio_id TEXT, currency TEXT NOT NULL, amount TEXT NOT NULL, balance_after TEXT, entry_type TEXT NOT NULL, reference_id TEXT, created_at TEXT NOT NULL);
+            CREATE TABLE cash_balances (id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT, portfolio_id TEXT, currency TEXT NOT NULL, balance TEXT NOT NULL, updated_at TEXT NOT NULL);
+            INSERT INTO holdings VALUES ('Main', 'INFY', '', 'INR', 2, 100, '', '2026-11-02T00:00:00+00:00');
+            INSERT INTO transactions VALUES (1, 'Main', 'INFY', 'buy', 2, 100, 'INR', 0, '2026-11-02', 'legacy');
+            INSERT INTO price_cache VALUES ('Main', 'INFY', 101, '2026-11-02T00:00:00+00:00', 'legacy');
+            INSERT INTO order_intents VALUES (1, 'kite', 'kite-account', NULL, 'paper', 'legacy-order', '{}', 'pending', NULL, '2026-11-02T00:00:00+00:00', '2026-11-02T00:00:00+00:00');
+            INSERT INTO fills VALUES (1, 1, NULL, '1', '100', 'INR', '{}', '2026-11-02T00:00:00+00:00', '2026-11-02T00:00:00+00:00');
+            INSERT INTO cash_ledger VALUES (1, 'kite-account', NULL, 'INR', '10', NULL, 'deposit', NULL, '2026-11-02T00:00:00+00:00');
+            INSERT INTO cash_balances VALUES (1, 'kite-account', NULL, 'INR', '10', '2026-11-02T00:00:00+00:00');
+            """
+        )
+
+    db = Database(path)
+    db.init_db()
+    db.init_db()
+
+    assert db.list_holdings()[0]["shares"] == 2
+    assert db.list_transactions()[0]["notes"] == "legacy"
+    assert db.get_price_cache("Main", "INFY")["price"] == 101
+    assert db.get_order_intent(1)["idempotency_key"] == "legacy-order"
+    assert db.get_fill(1)["broker_id"] == "kite"
+    assert db.get_fill(1)["account_id"] == "kite-account"
+    assert db.get_cash_ledger(1)["account_id"] == "kite-account"
+    assert db.get_cash_balance(currency="INR", account_id="kite-account")["balance"] == "10"
+    with db.connect() as conn:
+        indexes = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+    assert {"idx_order_intents_status", "idx_fills_order_id", "idx_cash_ledger_scope_created"} <= indexes
+    new_id = db.insert_order_intent(make_intent("post-migration"))
+    assert db.get_order_intent(new_id)["idempotency_key"] == "post-migration"
+
+
 def test_order_intent_insert_and_read_preserves_serialized_payload(tmp_path):
     db = Database(tmp_path / "trading.sqlite3")
     db.init_db()
@@ -124,6 +165,43 @@ def test_fill_insert_read_and_duplicate_replay_is_rejected(tmp_path):
     with pytest.raises(sqlite3.IntegrityError):
         db.insert_fill(fill, order_id=order_id)
     assert len(db.list_fills(order_id)) == 1
+
+
+def test_fill_scope_must_match_referenced_order(tmp_path):
+    from datetime import datetime, timezone
+    from portfolio_tracker.trading_models import Fill
+
+    db = Database(tmp_path / "trading.sqlite3")
+    db.init_db()
+    order_id = db.insert_order_intent(make_intent(), broker_id="kite")
+    fill = Fill("fill-scope", "intent-001", Decimal("1"), Decimal("1500"), "INR", datetime.now(timezone.utc))
+
+    with pytest.raises(ValueError, match="broker_id"):
+        db.insert_fill(fill, order_id=order_id, broker_id="other-broker")
+    with pytest.raises(ValueError, match="account_id"):
+        db.insert_fill(fill, order_id=order_id, account_id="other-account")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"idempotency_key": "raw-empty-account", "portfolio_id": "", "account_id": "", "symbol": "INFY", "side": "buy", "order_type": "market", "time_in_force": "day", "quantity": "1", "currency": "INR", "mode": "paper"},
+        {"idempotency_key": "raw-missing-required", "account_id": "acct", "symbol": "INFY", "side": "buy", "order_type": "market", "time_in_force": "day", "quantity": "1", "currency": "INR"},
+    ],
+)
+def test_raw_order_intent_dictionaries_are_validated(payload, tmp_path):
+    db = Database(tmp_path / "trading.sqlite3")
+    db.init_db()
+    with pytest.raises(ValueError):
+        db.insert_order_intent(payload)
+
+
+def test_raw_order_intent_dictionary_is_converted_to_validated_model(tmp_path):
+    db = Database(tmp_path / "trading.sqlite3")
+    db.init_db()
+    payload = make_intent("raw-valid").to_dict()
+    order_id = db.insert_order_intent(payload)
+    assert db.get_order_intent(order_id)["idempotency_key"] == "raw-valid"
 
 
 @pytest.mark.parametrize("value", ["NaN", "Infinity", True, "1e100"])

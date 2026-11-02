@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import DB_PATH, ensure_dirs
+from .trading_models import OrderIntent
 
 _ORDER_STATUSES = frozenset({"pending", "submitted", "accepted", "partially_filled", "filled", "canceled", "rejected", "failed"})
 _MAX_DECIMAL_DIGITS = 38
@@ -116,6 +117,139 @@ def _currency(value: str) -> str:
     return value.upper()
 
 
+_MIGRATION_TABLES = {
+    "order_intents": """
+        CREATE TABLE order_intents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, broker_id TEXT NOT NULL, account_id TEXT, portfolio_id TEXT,
+            mode TEXT NOT NULL CHECK (mode IN ('paper', 'live')), idempotency_key TEXT NOT NULL UNIQUE,
+            order_payload TEXT NOT NULL CHECK (length(order_payload) > 0),
+            status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','submitted','accepted','partially_filled','filled','canceled','rejected','failed')),
+            external_order_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            CHECK (account_id IS NOT NULL OR portfolio_id IS NOT NULL)
+        )
+    """,
+    "fills": """
+        CREATE TABLE fills (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER NOT NULL REFERENCES order_intents(id),
+            broker_id TEXT NOT NULL, account_id TEXT NOT NULL, external_fill_id TEXT NOT NULL,
+            quantity TEXT NOT NULL CHECK (length(quantity) > 0), price TEXT NOT NULL CHECK (length(price) > 0),
+            currency TEXT NOT NULL, execution_payload TEXT NOT NULL DEFAULT '{}', filled_at TEXT NOT NULL, created_at TEXT NOT NULL,
+            UNIQUE (broker_id, account_id, order_id, external_fill_id)
+        )
+    """,
+    "cash_ledger": """
+        CREATE TABLE cash_ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL DEFAULT '', portfolio_id TEXT NOT NULL DEFAULT '',
+            currency TEXT NOT NULL, amount TEXT NOT NULL CHECK (length(amount) > 0),
+            balance_after TEXT CHECK (balance_after IS NULL OR length(balance_after) > 0),
+            entry_type TEXT NOT NULL, reference_id TEXT, created_at TEXT NOT NULL,
+            CHECK (account_id <> '' OR portfolio_id <> '')
+        )
+    """,
+    "cash_balances": """
+        CREATE TABLE cash_balances (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL DEFAULT '', portfolio_id TEXT NOT NULL DEFAULT '',
+            currency TEXT NOT NULL, balance TEXT NOT NULL CHECK (length(balance) > 0), updated_at TEXT NOT NULL,
+            UNIQUE(account_id, portfolio_id, currency), CHECK (account_id <> '' OR portfolio_id <> '')
+        )
+    """,
+}
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _table_sql(conn: sqlite3.Connection, table: str) -> str:
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+    return (row["sql"] or "").lower() if row else ""
+
+
+def _needs_migration(conn: sqlite3.Connection, table: str) -> bool:
+    required = {
+        "order_intents": {"id", "broker_id", "account_id", "portfolio_id", "mode", "idempotency_key", "order_payload", "status", "external_order_id", "created_at", "updated_at"},
+        "fills": {"id", "order_id", "broker_id", "account_id", "external_fill_id", "quantity", "price", "currency", "execution_payload", "filled_at", "created_at"},
+        "cash_ledger": {"id", "account_id", "portfolio_id", "currency", "amount", "balance_after", "entry_type", "reference_id", "created_at"},
+        "cash_balances": {"id", "account_id", "portfolio_id", "currency", "balance", "updated_at"},
+    }
+    columns = _table_columns(conn, table)
+    if not required[table] <= columns:
+        return True
+    sql = _table_sql(conn, table)
+    if table == "order_intents":
+        return "check (status in" not in sql
+    if table == "fills":
+        return "unique (broker_id, account_id, order_id, external_fill_id)" not in sql
+    return "account_id <> '' or portfolio_id <> ''" not in sql
+
+
+def _migrate_legacy_tables(conn: sqlite3.Connection) -> None:
+    tables = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    rebuild = {table for table in _MIGRATION_TABLES if table in tables and _needs_migration(conn, table)}
+    if not rebuild:
+        return
+
+    saved = {table: [dict(row) for row in conn.execute(f"SELECT * FROM {table} ORDER BY id")] for table in rebuild}
+    order_scope = {
+        row["id"]: (row.get("broker_id") or "paper", row.get("account_id") or "")
+        for row in saved.get("order_intents", [])
+    }
+    if "order_intents" not in saved:
+        order_scope.update({
+            row["id"]: (row["broker_id"] or "paper", row["account_id"] or "")
+            for row in conn.execute("SELECT id, broker_id, account_id FROM order_intents")
+        })
+    for table in rebuild:
+        conn.execute(f"DROP TABLE {table}")
+    for table in rebuild:
+        conn.execute(_MIGRATION_TABLES[table])
+
+    if "order_intents" in rebuild:
+        for row in saved["order_intents"]:
+            account_id, portfolio_id = row.get("account_id"), row.get("portfolio_id")
+            if account_id is None and portfolio_id is None:
+                account_id = "legacy"
+            status = row.get("status") if row.get("status") in _ORDER_STATUSES else "pending"
+            mode = row.get("mode") if row.get("mode") in {"paper", "live"} else "paper"
+            conn.execute(
+                "INSERT INTO order_intents(id, broker_id, account_id, portfolio_id, mode, idempotency_key, order_payload, status, external_order_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (row["id"], row.get("broker_id") or "paper", account_id, portfolio_id, mode, row.get("idempotency_key") or f"legacy-{row['id']}", row.get("order_payload") or "{}", status, row.get("external_order_id"), row.get("created_at") or datetime.now(timezone.utc).isoformat(), row.get("updated_at") or row.get("created_at") or datetime.now(timezone.utc).isoformat()),
+            )
+    if "fills" in rebuild:
+        for row in saved["fills"]:
+            broker_id, account_id = order_scope.get(row["order_id"], (row.get("broker_id") or "paper", row.get("account_id") or ""))
+            external_fill_id = row.get("external_fill_id") or f"legacy-fill-{row['id']}"
+            conn.execute(
+                "INSERT INTO fills(id, order_id, broker_id, account_id, external_fill_id, quantity, price, currency, execution_payload, filled_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (row["id"], row["order_id"], row.get("broker_id") or broker_id, row.get("account_id") if row.get("account_id") is not None else account_id, external_fill_id, row.get("quantity") or "0", row.get("price") or "0", row.get("currency") or "INR", row.get("execution_payload") or "{}", row.get("filled_at") or datetime.now(timezone.utc).isoformat(), row.get("created_at") or datetime.now(timezone.utc).isoformat()),
+            )
+    for table in ("cash_ledger", "cash_balances"):
+        if table not in rebuild:
+            continue
+        for row in saved[table]:
+            account_id, portfolio_id = row.get("account_id") or "", row.get("portfolio_id") or ""
+            if not account_id and not portfolio_id:
+                account_id = "legacy"
+            if table == "cash_ledger":
+                conn.execute("INSERT INTO cash_ledger(id, account_id, portfolio_id, currency, amount, balance_after, entry_type, reference_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (row["id"], account_id, portfolio_id, row.get("currency") or "INR", row.get("amount") or "0", row.get("balance_after"), row.get("entry_type") or "legacy", row.get("reference_id"), row.get("created_at") or datetime.now(timezone.utc).isoformat()))
+            else:
+                conn.execute("INSERT INTO cash_balances(id, account_id, portfolio_id, currency, balance, updated_at) VALUES (?, ?, ?, ?, ?, ?)", (row["id"], account_id, portfolio_id, row.get("currency") or "INR", row.get("balance") or "0", row.get("updated_at") or datetime.now(timezone.utc).isoformat()))
+
+
+def _ensure_supporting_objects(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE INDEX IF NOT EXISTS idx_order_intents_account_created ON order_intents(account_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_order_intents_status ON order_intents(status);
+        CREATE INDEX IF NOT EXISTS idx_fills_order_id ON fills(order_id);
+        CREATE INDEX IF NOT EXISTS idx_cash_ledger_scope_created ON cash_ledger(account_id, portfolio_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_audit_events_entity ON audit_events(entity_type, entity_id, id);
+        CREATE TRIGGER IF NOT EXISTS audit_events_no_update BEFORE UPDATE ON audit_events BEGIN SELECT RAISE(ABORT, 'audit_events is append-only'); END;
+        CREATE TRIGGER IF NOT EXISTS audit_events_no_delete BEFORE DELETE ON audit_events BEGIN SELECT RAISE(ABORT, 'audit_events is append-only'); END;
+        """
+    )
+
+
 @dataclass
 class Holding:
     portfolio: str
@@ -140,12 +274,23 @@ class Database:
 
     def init_db(self) -> None:
         with self.connect() as conn:
+            conn.execute("PRAGMA foreign_keys = OFF")
             conn.executescript(SCHEMA)
+            _migrate_legacy_tables(conn)
+            _ensure_supporting_objects(conn)
+            conn.execute("PRAGMA foreign_keys = ON")
 
     def insert_order_intent(self, intent: Any, *, broker_id: str = "paper", status: str = "pending", external_order_id: str | None = None) -> int:
-        payload = intent.to_dict() if hasattr(intent, "to_dict") else intent
-        if not isinstance(payload, dict):
-            raise TypeError("intent must expose to_dict() or be a dictionary")
+        if isinstance(intent, OrderIntent):
+            validated = intent
+        elif isinstance(intent, dict):
+            try:
+                validated = OrderIntent(**intent)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("intent dictionary is not a valid OrderIntent") from exc
+        else:
+            raise TypeError("intent must be an OrderIntent or a dictionary")
+        payload = validated.to_dict()
         if status not in _ORDER_STATUSES:
             raise ValueError(f"status must be one of: {', '.join(sorted(_ORDER_STATUSES))}")
         encoded = _canonical_json(payload, "order payload")
@@ -176,14 +321,19 @@ class Database:
                 if row is None:
                     raise ValueError("order for fill was not found")
                 order_id = row["id"]
-                broker_id = broker_id or row["broker_id"]
-                account_id = account_id or row["account_id"] or ""
             else:
-                row = conn.execute("SELECT broker_id, account_id FROM order_intents WHERE id=?", (order_id,)).fetchone()
+                row = conn.execute("SELECT broker_id, account_id, idempotency_key FROM order_intents WHERE id=?", (order_id,)).fetchone()
                 if row is None:
                     raise ValueError("order for fill was not found")
-                broker_id = broker_id or row["broker_id"]
-                account_id = account_id or row["account_id"] or ""
+                if payload["intent_idempotency_key"] != row["idempotency_key"]:
+                    raise ValueError("fill does not belong to the referenced order")
+            expected_broker_id = row["broker_id"]
+            expected_account_id = row["account_id"] or ""
+            if broker_id is not None and broker_id != expected_broker_id:
+                raise ValueError("broker_id does not match the referenced order")
+            if account_id is not None and account_id != expected_account_id:
+                raise ValueError("account_id does not match the referenced order")
+            broker_id, account_id = expected_broker_id, expected_account_id
             quantity = _canonical_decimal(payload["quantity"], "fill quantity", positive=True)
             price = _canonical_decimal(payload["price"], "fill price", positive=True)
             encoded = _canonical_json({} if execution_payload is None else execution_payload, "execution payload")
