@@ -63,6 +63,38 @@ def test_conflicting_duplicate_rows_are_rejected_atomically(tmp_path):
     assert db.list_holdings() == []
 
 
+def test_validation_precision_order_independence_and_provenance(tmp_path):
+    db = Database(tmp_path / "portfolio.sqlite3")
+    records = [
+        {"symbol": "AAPL", "shares": "0.123456789012345678", "average_cost": "180.250000000000000001", "imported_at": "2026-11-02T12:00:00+00:00", "source": "file"},
+        {"symbol": "MSFT", "shares": "1", "average_cost": "400", "imported_at": "2026-11-02T12:00:00+00:00"},
+    ]
+    first = import_indmoney_records(db, records, source="explicit-source")
+    second = import_indmoney_records(db, list(reversed(records)), source="explicit-source")
+    assert (first.imported, second.skipped) == (2, 2)
+    with db.connect() as conn:
+        row = conn.execute("SELECT shares, avg_cost, source, source_imported_at, ingested_at FROM indmoney_holdings WHERE symbol='AAPL'").fetchone()
+        assert row["shares"] == "0.123456789012345678"
+        assert row["avg_cost"] == "180.250000000000000001"
+        assert row["source"] == "explicit-source"
+        assert row["source_imported_at"].endswith("+00:00")
+        assert row["ingested_at"] and row["ingested_at"] != row["source_imported_at"]
+
+
+def test_timezone_and_namespace_validation(tmp_path):
+    db = Database(tmp_path / "portfolio.sqlite3")
+    with pytest.raises(ValueError, match="timezone"):
+        import_indmoney_records(db, [{"symbol": "AAPL", "shares": "1", "average_cost": "1", "imported_at": "2026-11-02T12:00:00"}])
+    with pytest.raises(ValueError, match="dedicated"):
+        import_indmoney_records(db, [{"symbol": "AAPL", "shares": "1", "average_cost": "1", "portfolio": "India"}])
+
+
 def test_malformed_csv_is_rejected(tmp_path):
     with pytest.raises(ValueError):
         import_indmoney_csv(Database(tmp_path / "portfolio.sqlite3"), "symbol,shares,average_cost\n\"AAPL,1,100\n")
+
+
+def test_duplicate_headers_after_alias_normalization_are_rejected():
+    with pytest.raises(ValueError, match="alias normalization"):
+        from portfolio_tracker.imports.indmoney import parse_indmoney_csv
+        parse_indmoney_csv("symbol,ticker,shares,average_cost\nAAPL,AAPL,1,1\n")

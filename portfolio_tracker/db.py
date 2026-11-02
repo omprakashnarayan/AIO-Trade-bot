@@ -24,6 +24,12 @@ CREATE TABLE IF NOT EXISTS holdings (
     currency TEXT NOT NULL DEFAULT 'INR', shares REAL NOT NULL DEFAULT 0, avg_cost REAL NOT NULL DEFAULT 0,
     notes TEXT DEFAULT '', updated_at TEXT NOT NULL, PRIMARY KEY (portfolio, symbol)
 );
+CREATE TABLE IF NOT EXISTS indmoney_holdings (
+    portfolio TEXT NOT NULL, symbol TEXT NOT NULL, label TEXT DEFAULT '', currency TEXT NOT NULL,
+    shares TEXT NOT NULL CHECK (length(shares) > 0), avg_cost TEXT NOT NULL CHECK (length(avg_cost) > 0),
+    account TEXT DEFAULT '', source TEXT NOT NULL, source_imported_at TEXT NOT NULL,
+    ingested_at TEXT NOT NULL, PRIMARY KEY (portfolio, symbol)
+);
 CREATE TABLE IF NOT EXISTS transactions (
     id INTEGER PRIMARY KEY AUTOINCREMENT, portfolio TEXT NOT NULL DEFAULT 'Main', symbol TEXT NOT NULL,
     side TEXT NOT NULL, shares REAL NOT NULL, price REAL NOT NULL, currency TEXT NOT NULL DEFAULT 'INR',
@@ -570,6 +576,22 @@ class Database:
         now = datetime.now(timezone.utc).isoformat()
         with self.connect() as conn:
             conn.execute("INSERT INTO holdings(portfolio, symbol, label, currency, shares, avg_cost, notes, updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(portfolio, symbol) DO UPDATE SET label=excluded.label, currency=excluded.currency, shares=excluded.shares, avg_cost=excluded.avg_cost, notes=excluded.notes, updated_at=excluded.updated_at", (portfolio, symbol.upper(), label, currency.upper(), shares, avg_cost, notes, now))
+
+    @staticmethod
+    def upsert_indmoney_holding_conn(conn: sqlite3.Connection, *, portfolio: str, symbol: str, label: str, account: str, shares: Decimal, avg_cost: Decimal, source: str, source_imported_at: str, ingested_at: str) -> None:
+        shares_text = _canonical_decimal(shares, "shares", nonnegative=True)
+        avg_cost_text = _canonical_decimal(avg_cost, "avg_cost", nonnegative=True)
+        conn.execute("""INSERT INTO indmoney_holdings
+            (portfolio, symbol, label, currency, shares, avg_cost, account, source, source_imported_at, ingested_at)
+            VALUES (?, ?, ?, 'USD', ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(portfolio, symbol) DO UPDATE SET label=excluded.label,
+            shares=excluded.shares, avg_cost=excluded.avg_cost, account=excluded.account,
+            source=excluded.source, source_imported_at=excluded.source_imported_at,
+            ingested_at=excluded.ingested_at""", (portfolio, symbol, label, shares_text, avg_cost_text, account, source, source_imported_at, ingested_at))
+
+    def upsert_indmoney_holding(self, **kwargs: Any) -> None:
+        with self.connect() as conn:
+            self.upsert_indmoney_holding_conn(conn, **kwargs)
 
     def adjust_holding(self, symbol: str, delta_shares: float, trade_price: float, side: str, fees: float = 0.0, trade_date: str | None = None, notes: str = "", portfolio: str = "Main", currency: str = "INR") -> None:
         delta = Decimal(_canonical_decimal(delta_shares, "delta_shares", positive=True))
