@@ -181,3 +181,16 @@ def test_max_idempotency_key_has_bounded_fill_id(tmp_path):
 def test_invalid_slippage_multiplier_rejected(tmp_path):
     with pytest.raises(ValueError, match="slippage_bps"):
         PaperBroker(Database(tmp_path / "db.sqlite"), slippage_bps="10000")
+
+
+def test_same_broker_portfolio_isolated_by_account(tmp_path):
+    db = Database(tmp_path / "db.sqlite")
+    first = PaperBroker(db)
+    second = PaperBroker(db)
+    first.seed_cash("1000", currency="INR", account_id="a1", portfolio_id="p1")
+    second.seed_cash("1000", currency="INR", account_id="a2", portfolio_id="p1")
+    first.submit(intent("a1-buy", account="a1"), price="100")
+    result = second.submit(intent("a2-sell", side="sell", account="a2"), price="100")
+    assert result.status == "rejected"
+    assert db.get_paper_holding(account_id="a1", portfolio="p1", symbol="INFY")["shares"] == "2"
+    assert db.get_paper_holding(account_id="a2", portfolio="p1", symbol="INFY") is None

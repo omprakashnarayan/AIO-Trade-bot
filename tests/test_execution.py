@@ -65,3 +65,42 @@ def test_gateway_requires_validated_intent(tmp_path):
     gateway, _ = make_gateway(tmp_path)
     with pytest.raises(TypeError):
         gateway.submit({"idempotency_key": "bad"}, quote_price=Decimal("100"))
+
+
+def test_position_weight_is_enforced_atomically_in_broker(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    db = Database(tmp_path / "execution.sqlite")
+    broker = PaperBroker(db)
+    broker.seed_cash("10000", currency="INR", account_id="acct", portfolio_id="p1")
+    gateway = ExecutionGateway(db, risk=RiskEngine(RiskLimits(max_position_weight="0.5"), db=db), paper_broker=broker)
+    intents = [make_intent("concurrent-1", qty="4"), make_intent("concurrent-2", qty="4")]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda order: gateway.submit(order, quote_price="100", portfolio_value="1000"), intents))
+    assert sorted(result.status for result in results) == ["rejected", "submitted"]
+    assert Decimal(db.get_paper_holding(account_id="acct", portfolio="p1", symbol="INFY")["shares"]) == Decimal("4")
+
+
+def test_audit_failure_after_fill_requires_reconciliation(tmp_path, monkeypatch):
+    gateway, db = make_gateway(tmp_path)
+    original = gateway._report
+    calls = {"count": 0}
+
+    def fail_result(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise RuntimeError("audit unavailable")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(gateway, "_report", fail_result)
+    result = gateway.submit(make_intent(), quote_price=Decimal("100"))
+    assert result.status == "reconciliation_required"
+    assert result.broker_result is not None and result.broker_result.filled
+
+
+def test_broker_failure_after_approval_records_failure_event(tmp_path, monkeypatch):
+    gateway, db = make_gateway(tmp_path)
+    monkeypatch.setattr(gateway.paper_broker, "submit", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("broker down")))
+    with pytest.raises(RuntimeError, match="broker down"):
+        gateway.submit(make_intent(), quote_price=Decimal("100"))
+    assert [row["event_type"] for row in db.list_audit_events()] == ["execution.risk_approved", "execution.failed"]

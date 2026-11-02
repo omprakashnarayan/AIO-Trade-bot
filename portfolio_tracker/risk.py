@@ -82,6 +82,9 @@ class RiskEngine:
         current_position_notional: Decimal | int | str = Decimal("0"),
         market_open: bool | None = None,
         session_allowed: bool | None = None,
+        fee_rate: Decimal | int | str = Decimal("0"),
+        slippage_bps: Decimal | int | str = Decimal("0"),
+        broker_id: str = "paper",
     ) -> RiskDecision:
         if not isinstance(intent, OrderIntent):
             raise TypeError("intent must be an OrderIntent")
@@ -104,9 +107,14 @@ class RiskEngine:
             age = self._clock() - timestamp
             if age < timedelta(0) or age > self.limits.max_quote_age:
                 return self._reject("stale_quote", "quote is stale", {"age_seconds": str(age.total_seconds())})
-        notional = price * intent.quantity
-        if self.limits.max_order_notional is not None and notional > self.limits.max_order_notional:
-            return self._reject("max_order_notional", "order notional exceeds limit", {"notional": str(notional), "limit": str(self.limits.max_order_notional)})
+        fee = _decimal(fee_rate, "fee_rate", nonnegative=True)
+        slippage = _decimal(slippage_bps, "slippage_bps", nonnegative=True)
+        assert fee is not None and slippage is not None
+        execution_price = price * (Decimal("1") + slippage / Decimal("10000") * (Decimal("1") if str(intent.side) == "buy" else Decimal("-1")))
+        notional = execution_price * intent.quantity
+        execution_exposure = notional * (Decimal("1") + fee if str(intent.side) == "buy" else Decimal("1") - fee)
+        if self.limits.max_order_notional is not None and execution_exposure > self.limits.max_order_notional:
+            return self._reject("max_order_notional", "executed order exposure exceeds limit", {"exposure": str(execution_exposure), "limit": str(self.limits.max_order_notional)})
         if self.limits.max_position_weight is not None:
             if portfolio_value is None:
                 return self._reject("missing_portfolio_value", "portfolio value is required for position-weight check", {})
@@ -119,7 +127,7 @@ class RiskEngine:
             weight = projected / value
             if weight > self.limits.max_position_weight:
                 return self._reject("max_position_weight", "projected position weight exceeds limit", {"weight": str(weight), "limit": str(self.limits.max_position_weight)})
-        duplicate = self._existing_intent(intent)
+        duplicate = self._existing_intent(intent, broker_id=broker_id)
         if duplicate is not None:
             payload = json.loads(duplicate["order_payload"])
             if payload != intent.to_dict():
@@ -127,7 +135,7 @@ class RiskEngine:
             return RiskDecision(True, "idempotent_retry", "identical idempotency key may be retried", {"order_id": duplicate["id"]})
         return RiskDecision(True, "approved", "risk checks passed", {"notional": str(notional)})
 
-    def _existing_intent(self, intent: OrderIntent):
+    def _existing_intent(self, intent: OrderIntent, *, broker_id: str = "paper"):
         if self.db is None:
             return None
         for row in self.db.list_order_intents():
@@ -135,7 +143,8 @@ class RiskEngine:
                 payload = json.loads(row["order_payload"])
             except (TypeError, json.JSONDecodeError):
                 continue
-            if payload.get("idempotency_key") == intent.idempotency_key and row["broker_id"] == "paper":
+            if (payload.get("idempotency_key") == intent.idempotency_key and row["broker_id"] == broker_id
+                    and row["account_id"] == intent.account_id and row["portfolio_id"] == intent.portfolio_id):
                 return row
         return None
 

@@ -62,7 +62,7 @@ class PaperBroker:
     def seed_cash(self, amount: Decimal | int | str, *, currency: str, account_id: str | None = None, portfolio_id: str | None = None) -> int:
         return self.db.upsert_cash_balance(balance=amount, currency=currency, account_id=account_id, portfolio_id=portfolio_id, broker_id=self.broker_id)
 
-    def submit(self, intent: OrderIntent, price: Decimal | int | str) -> PaperExecutionResult:
+    def submit(self, intent: OrderIntent, price: Decimal | int | str, *, max_position_weight: Decimal | None = None, portfolio_value: Decimal | None = None) -> PaperExecutionResult:
         if not isinstance(intent, OrderIntent):
             raise TypeError("intent must be an OrderIntent")
         if intent.mode is ExecutionMode.LIVE:
@@ -83,7 +83,7 @@ class PaperBroker:
         scope_portfolio = intent.portfolio_id if intent.portfolio_id is not None else ""
         cash_row = self.db.get_cash_balance(currency=intent.currency, account_id=scope_account, portfolio_id=scope_portfolio, broker_id=self.broker_id)
         cash = Decimal(cash_row["balance"]) if cash_row else Decimal("0")
-        holding = self.db.get_paper_holding(broker_id=self.broker_id, portfolio=scope_portfolio, symbol=intent.symbol)
+        holding = self.db.get_paper_holding(broker_id=self.broker_id, account_id=scope_account, portfolio=scope_portfolio, symbol=intent.symbol)
         owned = Decimal(holding["shares"]) if holding else Decimal("0")
         quantity = Decimal(intent.quantity)
         multiplier = Decimal("1") + (self.slippage_bps / Decimal("10000")) * (Decimal("1") if intent.side is OrderSide.BUY else Decimal("-1"))
@@ -99,7 +99,7 @@ class PaperBroker:
         elif intent.side is OrderSide.SELL and owned < quantity:
             reason = f"insufficient position: required {quantity}, owned {owned}"
         fill_id = "fill-" + hashlib.sha256((self.broker_id + "\x1f" + intent.idempotency_key).encode("utf-8")).hexdigest()
-        outcome = self.db.execute_paper_submission(intent=intent, broker_id=self.broker_id, quantity=quantity, fill_price=fill_price, fee=fee, total=total, now=now.isoformat(), fill_id=fill_id, reason=reason, audit_callback=self._audit)
+        outcome = self.db.execute_paper_submission(intent=intent, broker_id=self.broker_id, quantity=quantity, fill_price=fill_price, fee=fee, total=total, now=now.isoformat(), fill_id=fill_id, reason=reason, audit_callback=self._audit, max_position_weight=max_position_weight, portfolio_value=portfolio_value)
         fill = self._fill_from_row(outcome["fill"], intent.idempotency_key) if outcome["fill"] else None
         execution_total = total
         if fill and outcome["reused"]:

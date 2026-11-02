@@ -77,14 +77,27 @@ class ExecutionGateway:
             current_position_notional=current_position_notional,
             market_open=market_open,
             session_allowed=session_allowed,
+            fee_rate=self.paper_broker.fee_rate,
+            slippage_bps=self.paper_broker.slippage_bps,
+            broker_id=self.paper_broker.broker_id,
         )
         if not risk.allowed:
             self._report(intent, "execution.risk_rejected", risk)
             return ExecutionDecision("rejected", risk, error=risk.message)
         self._report(intent, "execution.risk_approved", risk)
-        result = self.paper_broker.submit(intent, quote_price)
+        try:
+            result = self.paper_broker.submit(intent, quote_price, max_position_weight=self.risk.limits.max_position_weight, portfolio_value=portfolio_value)
+        except Exception as exc:
+            try:
+                self._report(intent, "execution.failed", risk, {"error": str(exc), "reconciliation_required": True})
+            except Exception:
+                pass
+            raise
         status = "submitted" if result.status == "filled" else result.status
-        self._report(intent, "execution.paper_result", risk, {"status": result.status, "reused": result.reused, "order_id": result.order_id})
+        try:
+            self._report(intent, "execution.paper_result", risk, {"status": result.status, "reused": result.reused, "order_id": result.order_id})
+        except Exception as exc:
+            return ExecutionDecision("reconciliation_required", risk, result, f"execution completed but audit write failed: {exc}")
         return ExecutionDecision(status, risk, result, result.error)
 
     execute = submit

@@ -67,3 +67,15 @@ def test_duplicate_identical_intent_is_retry_but_conflict_rejects(tmp_path):
 def test_rejects_float_inputs_in_new_risk_logic(tmp_path):
     with pytest.raises(TypeError):
         engine(tmp_path, RiskLimits(max_order_notional="1000")).check(intent(), quote_price=100.0)
+
+
+def test_order_limit_includes_execution_slippage_and_fee(tmp_path):
+    result = engine(tmp_path, RiskLimits(max_order_notional="204")).check(intent(), quote_price="100", fee_rate="0.01", slippage_bps="100")
+    assert not result.allowed and result.code == "max_order_notional"
+
+
+def test_idempotency_scope_includes_account_and_portfolio(tmp_path):
+    db = Database(tmp_path / "risk.sqlite")
+    db.init_db()
+    db.insert_order_intent(intent().to_dict())
+    assert engine(tmp_path, RiskLimits()).check(intent(account="other"), quote_price="100").code == "approved"
