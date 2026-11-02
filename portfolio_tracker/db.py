@@ -153,6 +153,55 @@ _MIGRATION_TABLES = {
             UNIQUE(account_id, portfolio_id, currency), CHECK (account_id <> '' OR portfolio_id <> '')
         )
     """,
+    "audit_events": """
+        CREATE TABLE audit_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, event_type TEXT NOT NULL, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL,
+            broker_id TEXT, account_id TEXT, portfolio_id TEXT, mode TEXT CHECK (mode IS NULL OR mode IN ('paper', 'live')),
+            payload TEXT NOT NULL CHECK (length(payload) > 0), occurred_at TEXT NOT NULL, created_at TEXT NOT NULL
+        )
+    """,
+}
+
+_EXPECTED_COLUMNS = {
+    "order_intents": {
+        "id": (0, None), "broker_id": (1, None), "account_id": (0, None), "portfolio_id": (0, None),
+        "mode": (1, None), "idempotency_key": (1, None), "order_payload": (1, None), "status": (1, "'pending'"),
+        "external_order_id": (0, None), "created_at": (1, None), "updated_at": (1, None),
+    },
+    "fills": {
+        "id": (0, None), "order_id": (1, None), "broker_id": (1, None), "account_id": (1, None),
+        "external_fill_id": (1, None), "quantity": (1, None), "price": (1, None), "currency": (1, None),
+        "execution_payload": (1, "'{}'"), "filled_at": (1, None), "created_at": (1, None),
+    },
+    "cash_ledger": {
+        "id": (0, None), "account_id": (1, "''"), "portfolio_id": (1, "''"), "currency": (1, None),
+        "amount": (1, None), "balance_after": (0, None), "entry_type": (1, None), "reference_id": (0, None), "created_at": (1, None),
+    },
+    "cash_balances": {
+        "id": (0, None), "account_id": (1, "''"), "portfolio_id": (1, "''"), "currency": (1, None),
+        "balance": (1, None), "updated_at": (1, None),
+    },
+    "audit_events": {
+        "id": (0, None), "event_type": (1, None), "entity_type": (1, None), "entity_id": (1, None),
+        "broker_id": (0, None), "account_id": (0, None), "portfolio_id": (0, None), "mode": (0, None),
+        "payload": (1, None), "occurred_at": (1, None), "created_at": (1, None),
+    },
+}
+
+_EXPECTED_INDEXES = {
+    "order_intents": {"idx_order_intents_account_created": (False, ("account_id", "created_at")), "idx_order_intents_status": (False, ("status",))},
+    "fills": {"idx_fills_order_id": (False, ("order_id",))},
+    "cash_ledger": {"idx_cash_ledger_scope_created": (False, ("account_id", "portfolio_id", "created_at"))},
+    "cash_balances": {},
+    "audit_events": {"idx_audit_events_entity": (False, ("entity_type", "entity_id", "id"))},
+}
+
+_EXPECTED_CHECKS = {
+    "order_intents": ("mode in ('paper', 'live')", "length(order_payload) > 0", "status in (", "account_id is not null or portfolio_id is not null"),
+    "fills": ("length(quantity) > 0", "length(price) > 0"),
+    "cash_ledger": ("length(amount) > 0", "balance_after is null or length(balance_after) > 0", "account_id <> '' or portfolio_id <> ''"),
+    "cash_balances": ("length(balance) > 0", "account_id <> '' or portfolio_id <> ''"),
+    "audit_events": ("mode is null or mode in ('paper', 'live')", "length(payload) > 0"),
 }
 
 
@@ -165,22 +214,47 @@ def _table_sql(conn: sqlite3.Connection, table: str) -> str:
     return (row["sql"] or "").lower() if row else ""
 
 
+def _table_indexes(conn: sqlite3.Connection, table: str) -> dict[str, tuple[bool, tuple[str, ...]]]:
+    indexes = {}
+    for row in conn.execute(f"PRAGMA index_list({table})"):
+        name = row["name"]
+        columns = tuple(info["name"] for info in conn.execute(f"PRAGMA index_info({name})") if info["name"] is not None)
+        indexes[name] = (bool(row["unique"]), columns)
+    return indexes
+
+
 def _needs_migration(conn: sqlite3.Connection, table: str) -> bool:
-    required = {
-        "order_intents": {"id", "broker_id", "account_id", "portfolio_id", "mode", "idempotency_key", "order_payload", "status", "external_order_id", "created_at", "updated_at"},
-        "fills": {"id", "order_id", "broker_id", "account_id", "external_fill_id", "quantity", "price", "currency", "execution_payload", "filled_at", "created_at"},
-        "cash_ledger": {"id", "account_id", "portfolio_id", "currency", "amount", "balance_after", "entry_type", "reference_id", "created_at"},
-        "cash_balances": {"id", "account_id", "portfolio_id", "currency", "balance", "updated_at"},
-    }
-    columns = _table_columns(conn, table)
-    if not required[table] <= columns:
+    info = {row["name"]: row for row in conn.execute(f"PRAGMA table_info({table})")}
+    for name, (notnull, default) in _EXPECTED_COLUMNS[table].items():
+        column = info.get(name)
+        if column is None or bool(column["notnull"]) != bool(notnull):
+            return True
+        if default is not None and (column["dflt_value"] or "").replace(" ", "") != default.replace(" ", ""):
+            return True
+    if set(info) != set(_EXPECTED_COLUMNS[table]):
         return True
     sql = _table_sql(conn, table)
-    if table == "order_intents":
-        return "check (status in" not in sql
+    if "autoincrement" not in sql:
+        return True
+    if any(check not in sql for check in _EXPECTED_CHECKS[table]):
+        return True
+    indexes = _table_indexes(conn, table)
+    for name, expected in _EXPECTED_INDEXES[table].items():
+        if indexes.get(name) != expected:
+            return True
+    if table in {"order_intents", "fills", "cash_balances"}:
+        unique_columns = {
+            "order_intents": ("idempotency_key",),
+            "fills": ("broker_id", "account_id", "order_id", "external_fill_id"),
+            "cash_balances": ("account_id", "portfolio_id", "currency"),
+        }[table]
+        if not any(unique and columns == unique_columns for unique, columns in indexes.values()):
+            return True
     if table == "fills":
-        return "unique (broker_id, account_id, order_id, external_fill_id)" not in sql
-    return "account_id <> '' or portfolio_id <> ''" not in sql
+        foreign_keys = {(row["table"], row["from"], row["to"]) for row in conn.execute("PRAGMA foreign_key_list(fills)")}
+        if ("order_intents", "order_id", "id") not in foreign_keys:
+            return True
+    return False
 
 
 def _migrate_legacy_tables(conn: sqlite3.Connection) -> None:
@@ -221,7 +295,7 @@ def _migrate_legacy_tables(conn: sqlite3.Connection) -> None:
             external_fill_id = row.get("external_fill_id") or f"legacy-fill-{row['id']}"
             conn.execute(
                 "INSERT INTO fills(id, order_id, broker_id, account_id, external_fill_id, quantity, price, currency, execution_payload, filled_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (row["id"], row["order_id"], row.get("broker_id") or broker_id, row.get("account_id") if row.get("account_id") is not None else account_id, external_fill_id, row.get("quantity") or "0", row.get("price") or "0", row.get("currency") or "INR", row.get("execution_payload") or "{}", row.get("filled_at") or datetime.now(timezone.utc).isoformat(), row.get("created_at") or datetime.now(timezone.utc).isoformat()),
+                (row["id"], row["order_id"], broker_id, account_id, external_fill_id, row.get("quantity") or "0", row.get("price") or "0", row.get("currency") or "INR", row.get("execution_payload") or "{}", row.get("filled_at") or datetime.now(timezone.utc).isoformat(), row.get("created_at") or datetime.now(timezone.utc).isoformat()),
             )
     for table in ("cash_ledger", "cash_balances"):
         if table not in rebuild:
@@ -234,6 +308,9 @@ def _migrate_legacy_tables(conn: sqlite3.Connection) -> None:
                 conn.execute("INSERT INTO cash_ledger(id, account_id, portfolio_id, currency, amount, balance_after, entry_type, reference_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (row["id"], account_id, portfolio_id, row.get("currency") or "INR", row.get("amount") or "0", row.get("balance_after"), row.get("entry_type") or "legacy", row.get("reference_id"), row.get("created_at") or datetime.now(timezone.utc).isoformat()))
             else:
                 conn.execute("INSERT INTO cash_balances(id, account_id, portfolio_id, currency, balance, updated_at) VALUES (?, ?, ?, ?, ?, ?)", (row["id"], account_id, portfolio_id, row.get("currency") or "INR", row.get("balance") or "0", row.get("updated_at") or datetime.now(timezone.utc).isoformat()))
+    if "audit_events" in rebuild:
+        for row in saved["audit_events"]:
+            conn.execute("INSERT INTO audit_events(id, event_type, entity_type, entity_id, broker_id, account_id, portfolio_id, mode, payload, occurred_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (row["id"], row.get("event_type") or "legacy", row.get("entity_type") or "legacy", row.get("entity_id") or str(row["id"]), row.get("broker_id"), row.get("account_id"), row.get("portfolio_id"), row.get("mode") if row.get("mode") in {None, "paper", "live"} else None, row.get("payload") or "{}", row.get("occurred_at") or datetime.now(timezone.utc).isoformat(), row.get("created_at") or datetime.now(timezone.utc).isoformat()))
 
 
 def _ensure_supporting_objects(conn: sqlite3.Connection) -> None:

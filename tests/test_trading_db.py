@@ -34,6 +34,23 @@ def test_schema_initialization_is_idempotent(tmp_path):
     assert {"order_intents", "fills", "cash_ledger", "cash_balances", "audit_events"} <= tables
 
 
+
+
+def test_init_db_recreates_missing_required_index_without_losing_data(tmp_path):
+    db = Database(tmp_path / "trading.sqlite3")
+    db.init_db()
+    order_id = db.insert_order_intent(make_intent("index-preserved"))
+    with db.connect() as conn:
+        conn.execute("DROP INDEX idx_order_intents_status")
+
+    db.init_db()
+
+    assert db.get_order_intent(order_id)["idempotency_key"] == "index-preserved"
+    with db.connect() as conn:
+        indexes = {row["name"] for row in conn.execute("PRAGMA index_list(order_intents)")}
+    assert "idx_order_intents_status" in indexes
+
+
 def test_init_db_migrates_legacy_tables_without_losing_existing_data(tmp_path):
     path = tmp_path / "legacy.sqlite3"
     with sqlite3.connect(path) as conn:
@@ -43,14 +60,14 @@ def test_init_db_migrates_legacy_tables_without_losing_existing_data(tmp_path):
             CREATE TABLE transactions (id INTEGER PRIMARY KEY AUTOINCREMENT, portfolio TEXT NOT NULL, symbol TEXT NOT NULL, side TEXT NOT NULL, shares REAL NOT NULL, price REAL NOT NULL, currency TEXT NOT NULL, fees REAL NOT NULL, trade_date TEXT NOT NULL, notes TEXT);
             CREATE TABLE price_cache (portfolio TEXT NOT NULL, symbol TEXT NOT NULL, price REAL NOT NULL, as_of TEXT NOT NULL, source TEXT NOT NULL, PRIMARY KEY (portfolio, symbol));
             CREATE TABLE order_intents (id INTEGER PRIMARY KEY AUTOINCREMENT, broker_id TEXT NOT NULL, account_id TEXT, portfolio_id TEXT, mode TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE, order_payload TEXT NOT NULL, status TEXT NOT NULL, external_order_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-            CREATE TABLE fills (id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER NOT NULL, external_fill_id TEXT, quantity TEXT NOT NULL, price TEXT NOT NULL, currency TEXT NOT NULL, execution_payload TEXT, filled_at TEXT NOT NULL, created_at TEXT NOT NULL);
+            CREATE TABLE fills (id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER NOT NULL, broker_id TEXT, account_id TEXT, external_fill_id TEXT, quantity TEXT NOT NULL, price TEXT NOT NULL, currency TEXT NOT NULL, execution_payload TEXT, filled_at TEXT NOT NULL, created_at TEXT NOT NULL);
             CREATE TABLE cash_ledger (id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT, portfolio_id TEXT, currency TEXT NOT NULL, amount TEXT NOT NULL, balance_after TEXT, entry_type TEXT NOT NULL, reference_id TEXT, created_at TEXT NOT NULL);
             CREATE TABLE cash_balances (id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT, portfolio_id TEXT, currency TEXT NOT NULL, balance TEXT NOT NULL, updated_at TEXT NOT NULL);
             INSERT INTO holdings VALUES ('Main', 'INFY', '', 'INR', 2, 100, '', '2026-11-02T00:00:00+00:00');
             INSERT INTO transactions VALUES (1, 'Main', 'INFY', 'buy', 2, 100, 'INR', 0, '2026-11-02', 'legacy');
             INSERT INTO price_cache VALUES ('Main', 'INFY', 101, '2026-11-02T00:00:00+00:00', 'legacy');
             INSERT INTO order_intents VALUES (1, 'kite', 'kite-account', NULL, 'paper', 'legacy-order', '{}', 'pending', NULL, '2026-11-02T00:00:00+00:00', '2026-11-02T00:00:00+00:00');
-            INSERT INTO fills VALUES (1, 1, NULL, '1', '100', 'INR', '{}', '2026-11-02T00:00:00+00:00', '2026-11-02T00:00:00+00:00');
+            INSERT INTO fills VALUES (1, 1, 'wrong-broker', 'wrong-account', 'legacy-fill-1', '1', '100', 'INR', '{}', '2026-11-02T00:00:00+00:00', '2026-11-02T00:00:00+00:00');
             INSERT INTO cash_ledger VALUES (1, 'kite-account', NULL, 'INR', '10', NULL, 'deposit', NULL, '2026-11-02T00:00:00+00:00');
             INSERT INTO cash_balances VALUES (1, 'kite-account', NULL, 'INR', '10', '2026-11-02T00:00:00+00:00');
             """
