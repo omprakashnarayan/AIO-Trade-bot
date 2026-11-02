@@ -24,7 +24,8 @@ def test_buy_sell_and_scope(tmp_path):
     sold = b.submit(intent("k2", "sell", "1"), price="110")
     assert sold.status == "filled"
     assert b.db.list_fills() and len(b.db.list_cash_ledger()) == 2
-    assert b.db.list_holdings("p1")[0]["shares"] == 1.0
+    assert b.db.get_paper_holding(portfolio="p1", symbol="INFY")["shares"] == "1"
+    assert b.db.list_holdings("p1") == []
 
 
 def test_rejects_cash_and_position(tmp_path):
@@ -110,6 +111,22 @@ def test_broker_identity_isolates_cash_holdings_and_transactions(tmp_path):
     assert len(db.list_cash_ledger(broker_id="broker-a")) == 1
     assert len(db.list_cash_ledger(broker_id="broker-b")) == 1
     assert [row["broker_id"] for row in db.list_paper_transactions()] == ["broker-a", "broker-b"]
+
+
+def test_broker_identity_isolates_paper_state_without_manual_holdings_mirror(tmp_path):
+    db = Database(tmp_path / "db.sqlite")
+    first = PaperBroker(db, broker_id="broker-a")
+    second = PaperBroker(db, broker_id="broker-b")
+    first.seed_cash("1000", currency="INR", account_id="acct", portfolio_id="p1")
+    second.seed_cash("1000", currency="INR", account_id="acct", portfolio_id="p1")
+
+    first.submit(intent("a"), price="100")
+    second.submit(intent("b"), price="200")
+
+    assert db.get_paper_holding(broker_id="broker-a", portfolio="p1", symbol="INFY")["avg_cost"] == "100.000000000000000000"
+    assert db.get_paper_holding(broker_id="broker-b", portfolio="p1", symbol="INFY")["avg_cost"] == "200.000000000000000000"
+    assert db.list_holdings("p1") == []
+    assert db.list_transactions() == []
 
 
 def test_retry_appends_audit_without_mutating_trade_state(tmp_path):
