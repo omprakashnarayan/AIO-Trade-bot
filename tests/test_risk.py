@@ -64,6 +64,14 @@ def test_duplicate_identical_intent_is_retry_but_conflict_rejects(tmp_path):
     assert not conflict.allowed and conflict.code == "conflicting_idempotency"
 
 
+def test_risk_recognizes_db_insert_as_identical_retry(tmp_path):
+    db = Database(tmp_path / "risk.sqlite")
+    db.init_db()
+    db.insert_order_intent(intent().to_dict())
+    decision = RiskEngine(db=db).check(intent(), quote_price="100")
+    assert decision.allowed and decision.code == "idempotent_retry"
+
+
 def test_rejects_float_inputs_in_new_risk_logic(tmp_path):
     with pytest.raises(TypeError):
         engine(tmp_path, RiskLimits(max_order_notional="1000")).check(intent(), quote_price=100.0)

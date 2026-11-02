@@ -45,6 +45,16 @@ def test_duplicate_is_idempotent(tmp_path):
     assert len(b.db.list_fills()) == 1 and len(b.db.list_cash_ledger()) == 1
 
 
+def test_db_insert_then_paper_submission_reuses_scoped_intent(tmp_path):
+    b = broker(tmp_path)
+    inserted_id = b.db.insert_order_intent(intent().to_dict())
+    result = b.submit(intent(), price="100")
+    assert result.reused and result.order_id == inserted_id
+    assert b.db.list_order_intents()[0]["idempotency_key"] == "k1"
+    assert b.db.list_order_intents()[0]["canonical_idempotency_key"].startswith("paper-")
+    assert not b.db.list_fills()
+
+
 def test_fees_and_slippage(tmp_path):
     b = broker(tmp_path, fee_rate="0.01", slippage_bps="100")
     result = b.submit(intent(), price="100")

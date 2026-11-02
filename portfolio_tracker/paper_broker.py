@@ -10,6 +10,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Callable
 
 from .db import Database
+from .idempotency import canonical_idempotency_key
 from .trading_models import AssetClass, ExecutionMode, Fill, OrderIntent, OrderSide, OrderType
 
 
@@ -98,7 +99,8 @@ class PaperBroker:
             reason = f"insufficient cash: required {total}, available {cash}"
         elif intent.side is OrderSide.SELL and owned < quantity:
             reason = f"insufficient position: required {quantity}, owned {owned}"
-        fill_id = "fill-" + hashlib.sha256((self.broker_id + "\x1f" + intent.idempotency_key).encode("utf-8")).hexdigest()
+        canonical_key = canonical_idempotency_key(self.broker_id, intent.account_id, intent.portfolio_id, intent.idempotency_key)
+        fill_id = "fill-" + hashlib.sha256(canonical_key.encode("utf-8")).hexdigest()
         outcome = self.db.execute_paper_submission(intent=intent, broker_id=self.broker_id, quantity=quantity, fill_price=fill_price, fee=fee, total=total, now=now.isoformat(), fill_id=fill_id, reason=reason, audit_callback=self._audit, max_position_weight=max_position_weight, portfolio_value=portfolio_value)
         fill = self._fill_from_row(outcome["fill"], intent.idempotency_key) if outcome["fill"] else None
         execution_total = total

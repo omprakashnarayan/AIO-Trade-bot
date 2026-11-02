@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import hashlib
 import re
 import sqlite3
 from dataclasses import dataclass
@@ -11,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import DB_PATH, ensure_dirs
+from .idempotency import canonical_idempotency_key
 from .trading_models import OrderIntent
 
 _ORDER_STATUSES = frozenset({"pending", "submitted", "accepted", "partially_filled", "filled", "canceled", "rejected", "failed"})
@@ -41,7 +41,8 @@ CREATE TABLE IF NOT EXISTS price_cache (
 );
 CREATE TABLE IF NOT EXISTS order_intents (
     id INTEGER PRIMARY KEY AUTOINCREMENT, broker_id TEXT NOT NULL, account_id TEXT, portfolio_id TEXT,
-    mode TEXT NOT NULL CHECK (mode IN ('paper', 'live')), idempotency_key TEXT NOT NULL UNIQUE,
+    mode TEXT NOT NULL CHECK (mode IN ('paper', 'live')), idempotency_key TEXT NOT NULL,
+    canonical_idempotency_key TEXT NOT NULL UNIQUE,
     order_payload TEXT NOT NULL CHECK (length(order_payload) > 0),
     status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','submitted','accepted','partially_filled','filled','canceled','rejected','failed')),
     external_order_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
@@ -147,7 +148,8 @@ _MIGRATION_TABLES = {
     "order_intents": """
         CREATE TABLE order_intents (
             id INTEGER PRIMARY KEY AUTOINCREMENT, broker_id TEXT NOT NULL, account_id TEXT, portfolio_id TEXT,
-            mode TEXT NOT NULL CHECK (mode IN ('paper', 'live')), idempotency_key TEXT NOT NULL UNIQUE,
+            mode TEXT NOT NULL CHECK (mode IN ('paper', 'live')), idempotency_key TEXT NOT NULL,
+            canonical_idempotency_key TEXT NOT NULL UNIQUE,
             order_payload TEXT NOT NULL CHECK (length(order_payload) > 0),
             status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','submitted','accepted','partially_filled','filled','canceled','rejected','failed')),
             external_order_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
@@ -191,7 +193,7 @@ _MIGRATION_TABLES = {
 _EXPECTED_COLUMNS = {
     "order_intents": {
         "id": (0, None), "broker_id": (1, None), "account_id": (0, None), "portfolio_id": (0, None),
-        "mode": (1, None), "idempotency_key": (1, None), "order_payload": (1, None), "status": (1, "'pending'"),
+        "mode": (1, None), "idempotency_key": (1, None), "canonical_idempotency_key": (1, None), "order_payload": (1, None), "status": (1, "'pending'"),
         "external_order_id": (0, None), "created_at": (1, None), "updated_at": (1, None),
     },
     "fills": {
@@ -289,7 +291,7 @@ def _needs_migration(conn: sqlite3.Connection, table: str) -> bool:
             return True
     if table in {"order_intents", "fills", "cash_balances"}:
         unique_columns = {
-            "order_intents": ("idempotency_key",),
+            "order_intents": ("canonical_idempotency_key",),
             "fills": ("broker_id", "account_id", "order_id", "external_fill_id"),
             "cash_balances": ("broker_id", "account_id", "portfolio_id", "currency"),
         }[table]
@@ -331,8 +333,8 @@ def _migrate_legacy_tables(conn: sqlite3.Connection) -> None:
             status = row.get("status") if row.get("status") in _ORDER_STATUSES else "pending"
             mode = row.get("mode") if row.get("mode") in {"paper", "live"} else "paper"
             conn.execute(
-                "INSERT INTO order_intents(id, broker_id, account_id, portfolio_id, mode, idempotency_key, order_payload, status, external_order_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (row["id"], row.get("broker_id") or "paper", account_id, portfolio_id, mode, row.get("idempotency_key") or f"legacy-{row['id']}", row.get("order_payload") or "{}", status, row.get("external_order_id"), row.get("created_at") or datetime.now(timezone.utc).isoformat(), row.get("updated_at") or row.get("created_at") or datetime.now(timezone.utc).isoformat()),
+                "INSERT INTO order_intents(id, broker_id, account_id, portfolio_id, mode, idempotency_key, canonical_idempotency_key, order_payload, status, external_order_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (row["id"], row.get("broker_id") or "paper", account_id, portfolio_id, mode, row.get("idempotency_key") or f"legacy-{row['id']}", canonical_idempotency_key(row.get("broker_id") or "paper", account_id, portfolio_id, row.get("idempotency_key") or f"legacy-{row['id']}"), row.get("order_payload") or "{}", status, row.get("external_order_id"), row.get("created_at") or datetime.now(timezone.utc).isoformat(), row.get("updated_at") or row.get("created_at") or datetime.now(timezone.utc).isoformat()),
             )
     if "fills" in rebuild:
         for row in saved["fills"]:
@@ -451,12 +453,13 @@ class Database:
         if validated.broker_id is not None and validated.broker_id != broker_id:
             raise ValueError("broker_id does not match intent broker binding")
         payload = validated.to_dict()
+        canonical_key = canonical_idempotency_key(broker_id, validated.account_id, validated.portfolio_id, payload["idempotency_key"])
         if status not in _ORDER_STATUSES:
             raise ValueError(f"status must be one of: {', '.join(sorted(_ORDER_STATUSES))}")
         encoded = _canonical_json(payload, "order payload")
         now = datetime.now(timezone.utc).isoformat()
         with self.connect() as conn:
-            cursor = conn.execute("""INSERT INTO order_intents(broker_id, account_id, portfolio_id, mode, idempotency_key, order_payload, status, external_order_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (broker_id, payload.get("account_id"), payload.get("portfolio_id"), payload["mode"], payload["idempotency_key"], encoded, status, external_order_id, now, now))
+            cursor = conn.execute("""INSERT INTO order_intents(broker_id, account_id, portfolio_id, mode, idempotency_key, canonical_idempotency_key, order_payload, status, external_order_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (broker_id, payload.get("account_id"), payload.get("portfolio_id"), payload["mode"], payload["idempotency_key"], canonical_key, encoded, status, external_order_id, now, now))
             return int(cursor.lastrowid)
 
     def get_order_intent(self, order_id: int | None = None, *, idempotency_key: str | None = None) -> sqlite3.Row | None:
@@ -467,13 +470,12 @@ class Database:
 
     @staticmethod
     def paper_order_key(broker_id: str, account_id: str | None, portfolio_id: str | None, idempotency_key: str) -> str:
-        namespace = "\x1f".join((broker_id, account_id or "", portfolio_id or "", idempotency_key))
-        return "paper-" + hashlib.sha256(namespace.encode("utf-8")).hexdigest()
+        return canonical_idempotency_key(broker_id, account_id, portfolio_id, idempotency_key)
 
     def get_scoped_order_intent(self, *, broker_id: str, account_id: str | None, portfolio_id: str | None, idempotency_key: str) -> sqlite3.Row | None:
-        storage_key = self.paper_order_key(broker_id, account_id, portfolio_id, idempotency_key)
+        storage_key = canonical_idempotency_key(broker_id, account_id, portfolio_id, idempotency_key)
         with self.connect() as conn:
-            return conn.execute("SELECT * FROM order_intents WHERE broker_id=? AND account_id IS ? AND portfolio_id IS ? AND idempotency_key=?", (broker_id, account_id, portfolio_id, storage_key)).fetchone()
+            return conn.execute("SELECT * FROM order_intents WHERE broker_id=? AND account_id IS ? AND portfolio_id IS ? AND canonical_idempotency_key=?", (broker_id, account_id, portfolio_id, storage_key)).fetchone()
 
     def list_order_intents(self, status: str | None = None) -> list[sqlite3.Row]:
         if status is not None and status not in _ORDER_STATUSES:
@@ -639,11 +641,11 @@ class Database:
     def execute_paper_submission(self, *, intent: OrderIntent, broker_id: str, quantity: Decimal, fill_price: Decimal, fee: Decimal, total: Decimal, now: str, fill_id: str, reason: str | None = None, audit_callback=None, max_position_weight: Decimal | None = None, portfolio_value: Decimal | None = None) -> dict[str, Any]:
         account_id = intent.account_id or ""
         portfolio_id = intent.portfolio_id if intent.portfolio_id is not None else ""
-        storage_key = self.paper_order_key(broker_id, intent.account_id, intent.portfolio_id, intent.idempotency_key)
+        storage_key = canonical_idempotency_key(broker_id, intent.account_id, intent.portfolio_id, intent.idempotency_key)
         payload = _canonical_json(intent.to_dict(), "order payload")
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute("SELECT * FROM order_intents WHERE broker_id=? AND account_id IS ? AND portfolio_id IS ? AND idempotency_key=?", (broker_id, intent.account_id, intent.portfolio_id, storage_key)).fetchone()
+            row = conn.execute("SELECT * FROM order_intents WHERE broker_id=? AND account_id IS ? AND portfolio_id IS ? AND canonical_idempotency_key=?", (broker_id, intent.account_id, intent.portfolio_id, storage_key)).fetchone()
             if row is not None:
                 if row["order_payload"] != payload:
                     raise ValueError("conflicting order payload for reused idempotency key")
@@ -651,7 +653,7 @@ class Database:
                     audit_callback(conn, "order.retry", "order_intent", str(row["id"]), intent, {"reused": True}, now)
                 self._append_audit_event_conn(conn, "order.retry", "order_intent", str(row["id"]), {"intent": intent.to_dict(), "reused": True}, broker_id, intent.account_id, intent.portfolio_id, intent.mode.value, now)
                 return {"order_id": row["id"], "status": row["status"], "reused": True, "cash": self._cash_in_conn(conn, intent.currency, account_id, portfolio_id, broker_id), "fill": conn.execute("SELECT * FROM fills WHERE order_id=? ORDER BY id LIMIT 1", (row["id"],)).fetchone()}
-            cur = conn.execute("INSERT INTO order_intents(broker_id, account_id, portfolio_id, mode, idempotency_key, order_payload, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (broker_id, intent.account_id, intent.portfolio_id, intent.mode.value, storage_key, payload, "rejected" if reason else "accepted", now, now))
+            cur = conn.execute("INSERT INTO order_intents(broker_id, account_id, portfolio_id, mode, idempotency_key, canonical_idempotency_key, order_payload, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (broker_id, intent.account_id, intent.portfolio_id, intent.mode.value, intent.idempotency_key, storage_key, payload, "rejected" if reason else "accepted", now, now))
             order_id = int(cur.lastrowid)
             cash = self._cash_in_conn(conn, intent.currency, account_id, portfolio_id, broker_id)
             if reason:

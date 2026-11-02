@@ -11,6 +11,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Callable, Mapping
 
 from .trading_models import ExecutionMode, OrderIntent, OrderSide, OrderType, TimeInForce, TradeProposal
+from .idempotency import canonical_idempotency_key
 
 _MAX_EVIDENCE_IDS = 64
 _MAX_EVIDENCE_ID_LENGTH = 256
@@ -155,7 +156,7 @@ def _result(fact: MarketFact, portfolio: PortfolioFact, now: datetime, *, strate
     intent = OrderIntent(idempotency_key=f"{strategy}:{portfolio.portfolio_id}:{symbol}:{evaluated.isoformat()}", portfolio_id=portfolio.portfolio_id,
                          account_id=portfolio.account_id, symbol=fact.symbol, side=side, order_type=OrderType.LIMIT,
                          time_in_force=TimeInForce.DAY, quantity=fact.quantity, currency="INR", mode=ExecutionMode.PAPER, limit_price=price, broker_id=broker)
-    proposal = TradeProposal(proposal_id=f"proposal-{intent.idempotency_key}", intent=intent, strategy=strategy, rationale=rationale, expires_at=expires)
+    proposal = TradeProposal(proposal_id=f"proposal-{canonical_idempotency_key(broker, portfolio.account_id, portfolio.portfolio_id, intent.idempotency_key)}", intent=intent, strategy=strategy, rationale=rationale, expires_at=expires)
     return StrategyProposal(proposal=proposal, strategy_version=strategy, evidence_source_ids=evidence, metadata=metadata)
 
 

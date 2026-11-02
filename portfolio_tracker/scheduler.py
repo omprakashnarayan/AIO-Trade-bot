@@ -7,6 +7,7 @@ from typing import Callable, Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .strategies import ProposalResult, StrategyProposal, NoTradeProposal
+from .idempotency import canonical_idempotency_key
 from .trading_models import ExecutionMode
 
 
@@ -108,6 +109,8 @@ class ProposalScheduler:
                 raise SchedulerError("scheduler rejects non-paper proposals")
             if intent.broker_id is not None and intent.broker_id != metadata.get("broker_id"):
                 raise SchedulerError("proposal broker binding is inconsistent")
+            if metadata.get("broker_id") is not None:
+                canonical_idempotency_key(metadata["broker_id"], intent.account_id, intent.portfolio_id, intent.idempotency_key)
         if metadata.get("mode") == "live":
             raise SchedulerError("scheduler rejects live proposals")
         for field in ("broker_id", "account_id", "portfolio_id"):

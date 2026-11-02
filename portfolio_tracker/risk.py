@@ -9,6 +9,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Callable
 
 from .db import Database
+from .idempotency import canonical_idempotency_key
 from .trading_models import OrderIntent
 
 
@@ -143,7 +144,8 @@ class RiskEngine:
                 payload = json.loads(row["order_payload"])
             except (TypeError, json.JSONDecodeError):
                 continue
-            if (payload.get("idempotency_key") == intent.idempotency_key and row["broker_id"] == broker_id
+            expected_key = canonical_idempotency_key(broker_id, intent.account_id, intent.portfolio_id, intent.idempotency_key)
+            if (row["canonical_idempotency_key"] == expected_key and row["broker_id"] == broker_id
                     and row["account_id"] == intent.account_id and row["portfolio_id"] == intent.portfolio_id):
                 return row
         return None
