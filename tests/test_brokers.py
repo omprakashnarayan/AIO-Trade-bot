@@ -7,7 +7,8 @@ from portfolio_tracker.brokers import (
     AdapterConfigurationError, BrokerAdapterError, KiteAdapter, KiteConfig,
     LiveExecutionDisabled, UpstoxAdapter, UpstoxConfig,
 )
-from portfolio_tracker.brokers.base import _gateway_capability
+from portfolio_tracker.db import Database
+from portfolio_tracker.execution import ExecutionGateway
 from portfolio_tracker.trading_models import ExecutionMode, OrderIntent, OrderType, TimeInForce
 
 
@@ -15,6 +16,10 @@ def intent(mode=ExecutionMode.LIVE, *, account_id="acct", order_type=OrderType.M
     return OrderIntent("broker-order", "p1", "INFY", "buy", order_type, TimeInForce.DAY, "1", "INR", mode,
                        account_id=account_id, limit_price="101" if order_type is OrderType.LIMIT else None,
                        stop_price="99" if order_type in {OrderType.STOP, OrderType.STOP_LIMIT} else None)
+
+
+def authorize(adapter, tmp_path):
+    return ExecutionGateway(Database(tmp_path / "gateway.sqlite")).authorize_adapter(adapter)
 
 
 def test_configs_require_auth_for_explicit_live_and_do_not_expose_secrets():
@@ -65,26 +70,45 @@ def test_paper_intent_must_stay_on_gateway_even_when_adapter_has_transport():
     assert calls == []
 
 
-def test_account_scope_and_expired_token_rejected_before_live_call():
+def test_account_scope_and_expired_token_rejected_before_live_call(tmp_path):
     calls = []
     expired = datetime.now(timezone.utc) - timedelta(minutes=1)
     adapter = KiteAdapter(KiteConfig(account_id="acct", api_key="key", access_token="token", live_enabled=True,
                                      token_expires_at=expired), transport=lambda op, payload: calls.append(op) or {})
+    authorize(adapter, tmp_path)
     with pytest.raises(BrokerAdapterError, match="account"):
-        adapter._submit_order(intent(account_id="other"), _gateway_capability())
+        adapter._submit_order(intent(account_id="other"), adapter._execution_capability)
     with pytest.raises(BrokerAdapterError, match="expired"):
-        adapter._submit_order(intent(), _gateway_capability())
+        adapter._submit_order(intent(), adapter._execution_capability)
     assert calls == []
 
 
-def test_kite_payload_forwards_all_validated_order_fields_and_response_id_is_required():
+def test_runtime_expiry_blocks_submit_and_cancel(monkeypatch, tmp_path):
+    from portfolio_tracker.brokers import base
+
+    expiry = datetime(2030, 1, 1, tzinfo=timezone.utc)
+    calls = []
+    adapter = KiteAdapter(KiteConfig(account_id="acct", api_key="key", access_token="token", live_enabled=True,
+                                     token_expires_at=expiry),
+                          transport=lambda op, payload: calls.append(op) or {"data": {"order_id": "x"}})
+    authorize(adapter, tmp_path)
+    monkeypatch.setattr(base, "utc_now", lambda: expiry)
+    with pytest.raises(BrokerAdapterError, match="expired"):
+        adapter._submit_order(intent(), adapter._execution_capability)
+    with pytest.raises(BrokerAdapterError, match="expired"):
+        adapter._cancel_order("x", adapter._execution_capability)
+    assert calls == []
+
+
+def test_kite_payload_forwards_all_validated_order_fields_and_response_id_is_required(tmp_path):
     seen = []
     def transport(operation, payload):
         seen.append((operation, payload))
         return {"data": {"order_id": "k-1", "status": "open"}}
     adapter = KiteAdapter(KiteConfig(account_id="acct", api_key="key", access_token="token", live_enabled=True,
                                      exchange_symbols={"NSE:INFY": "NSE:INFY"}), transport=transport)
-    receipt = adapter._submit_order(intent(order_type=OrderType.LIMIT), _gateway_capability())
+    authorize(adapter, tmp_path)
+    receipt = adapter._submit_order(intent(order_type=OrderType.LIMIT), adapter._execution_capability)
     assert receipt.broker_order_id == "k-1"
     payload = seen[0][1]
     for key in ("account_id", "portfolio_id", "symbol", "side", "quantity", "order_type", "limit_price",
@@ -92,8 +116,9 @@ def test_kite_payload_forwards_all_validated_order_fields_and_response_id_is_req
         assert key in payload
     bad = KiteAdapter(KiteConfig(account_id="acct", api_key="key", access_token="token", live_enabled=True),
                       transport=lambda op, payload: {"data": {"status": "open"}})
+    authorize(bad, tmp_path)
     with pytest.raises(BrokerAdapterError, match="no order ID"):
-        bad._submit_order(intent(), _gateway_capability())
+        bad._submit_order(intent(), bad._execution_capability)
 
 
 def test_symbol_mapping_and_redacted_provider_error():
@@ -112,7 +137,7 @@ def test_symbol_mapping_and_redacted_provider_error():
     assert "secret-token" not in str(error.value)
 
 
-def test_upstox_direct_live_transport_is_rejected_and_provider_mapping_is_distinct():
+def test_upstox_direct_live_transport_is_rejected_and_provider_mapping_is_distinct(tmp_path):
     seen = []
     def transport(operation, payload):
         seen.append((operation, payload))
@@ -121,12 +146,42 @@ def test_upstox_direct_live_transport_is_rejected_and_provider_mapping_is_distin
                                          exchange_symbols={"NSE:INFY": "NSE_EQ|INE009A01021"}), transport=transport)
     with pytest.raises(LiveExecutionDisabled):
         adapter.submit_order(intent())
-    receipt = adapter._submit_order(intent(), _gateway_capability())
+    authorize(adapter, tmp_path)
+    receipt = adapter._submit_order(intent(), adapter._execution_capability)
     assert receipt.broker_order_id == "u-1"
     assert seen[0][1]["instrument_token"] == "NSE_EQ|INE009A01021"
     assert seen[0][1]["transaction_type"] == "BUY"
     assert seen[0][1]["validity"] == "DAY"
     assert "token" not in repr(adapter) and "client" not in repr(adapter)
+
+
+def test_forged_or_unbound_capability_cannot_authorize_write(tmp_path):
+    from portfolio_tracker.brokers.base import _ExecutionCapability, _mint_execution_capability
+
+    calls = []
+    adapter = KiteAdapter(KiteConfig(account_id="acct", api_key="key", access_token="token", live_enabled=True),
+                          transport=lambda op, payload: calls.append(op) or {"data": {"order_id": "x"}})
+    with pytest.raises(TypeError):
+        _ExecutionCapability(object())
+    with pytest.raises(LiveExecutionDisabled):
+        adapter._submit_order(intent(), _mint_execution_capability())
+    authorize(adapter, tmp_path)
+    with pytest.raises(LiveExecutionDisabled):
+        adapter._submit_order(intent(), _mint_execution_capability())
+    assert calls == []
+
+
+def test_transport_exception_chain_does_not_retain_secret():
+    secret = "secret-token"
+
+    def transport(operation, payload):
+        raise RuntimeError(f"provider rejected bearer {secret}")
+
+    adapter = KiteAdapter(KiteConfig(account_id="acct", api_key="key", access_token=secret), transport=transport)
+    with pytest.raises(BrokerAdapterError) as error:
+        adapter.quote("INFY")
+    assert error.value.__cause__ is None
+    assert secret not in repr(error.value)
 
 
 def test_metadata_contains_scope_capabilities_and_token_expiry():

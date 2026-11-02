@@ -179,14 +179,21 @@ class Transport(Protocol):
     def __call__(self, operation: str, payload: Mapping[str, Any]) -> Mapping[str, Any]: ...
 
 
+_CAPABILITY_NONCE = object()
+
+
 class _ExecutionCapability:
-    """Opaque marker; no public constructor or exported bypass exists."""
-    __slots__ = ()
+    """Opaque capability whose exact instance is bound by ExecutionGateway."""
+    __slots__ = ("_nonce",)
+
+    def __init__(self, nonce: object) -> None:
+        if nonce is not _CAPABILITY_NONCE:
+            raise TypeError("execution capabilities are minted by ExecutionGateway")
+        self._nonce = nonce
 
 
-# Deliberately private: the not-yet-implemented live gateway is the only future owner.
-def _gateway_capability() -> _ExecutionCapability:
-    return _ExecutionCapability()
+def _mint_execution_capability() -> _ExecutionCapability:
+    return _ExecutionCapability(_CAPABILITY_NONCE)
 
 
 def require_intent(intent: OrderIntent) -> OrderIntent:
@@ -216,6 +223,7 @@ class ConfiguredAdapter:
         self._live_enabled = live_enabled
         self._transport = transport
         self._token_expiry = token_expiry
+        self._execution_capability: _ExecutionCapability | None = None
         self._secrets = tuple(secret for secret in secrets if isinstance(secret, str) and secret)
         mode = "live" if live_enabled else "paper/read_only"
         self.metadata = BrokerMetadata(self.provider_name, account_id, broker_id, mode, capabilities, token_expiry=token_expiry)
@@ -236,9 +244,9 @@ class ConfiguredAdapter:
         except BrokerAdapterError as exc:
             raise BrokerAdapterError(exc.code, self._redact(exc.message), provider=self.provider_name,
                                      retryable=exc.retryable, status=exc.status,
-                                     rate_limit=exc.rate_limit, token_expiry=exc.token_expiry) from exc
-        except Exception as exc:
-            raise BrokerAdapterError("transport_error", "provider transport failed", provider=self.provider_name, retryable=True) from exc
+                                     rate_limit=exc.rate_limit, token_expiry=exc.token_expiry) from None
+        except Exception:
+            raise BrokerAdapterError("transport_error", "provider transport failed", provider=self.provider_name, retryable=True) from None
         if not isinstance(result, Mapping):
             raise BrokerAdapterError("invalid_response", "provider response must be a mapping", provider=self.provider_name)
         error = result.get("error")
@@ -268,8 +276,14 @@ class ConfiguredAdapter:
 
     def _assert_token_valid(self) -> None:
         expiry = self._token_expiry
-        if expiry and expiry.expired:
-            raise BrokerAdapterError("token_expired", "access token is expired", provider=self.provider_name, token_expiry=expiry)
+        if expiry and expiry.expires_at is not None and utc_now() >= expiry.expires_at:
+            current = TokenExpiryMetadata(expiry.expires_at, True)
+            raise BrokerAdapterError("token_expired", "access token is expired", provider=self.provider_name, token_expiry=current)
+
+    def _bind_execution_capability(self, capability: _ExecutionCapability) -> None:
+        if not isinstance(capability, _ExecutionCapability):
+            raise TypeError("invalid execution capability")
+        self._execution_capability = capability
 
     def _write_guard(self, intent: OrderIntent) -> OrderIntent:
         require_intent(intent)
@@ -283,7 +297,7 @@ class ConfiguredAdapter:
 
     def _authorized_write(self, intent: OrderIntent, capability: object) -> OrderIntent:
         require_intent(intent)
-        if not isinstance(capability, _ExecutionCapability):
+        if capability is not self._execution_capability:
             raise LiveExecutionDisabled(self.provider_name)
         if intent.mode.value == "paper":
             raise BrokerAdapterError("paper_requires_gateway", "route PAPER intents through ExecutionGateway/PaperBroker", provider=self.provider_name)

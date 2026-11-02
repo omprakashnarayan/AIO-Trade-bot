@@ -59,7 +59,7 @@ class KiteAdapter(ConfiguredAdapter):
             return Quote(symbol.upper(), exchange.upper(), Decimal(str(data["price"])), str(data.get("currency", "INR")),
                          _as_datetime(data.get("as_of") or response.get("as_of"), self.provider_name), provider_symbol)
         except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
-            raise BrokerAdapterError("invalid_response", "quote response is malformed", provider=self.provider_name) from exc
+            raise BrokerAdapterError("invalid_response", "quote response is malformed", provider=self.provider_name) from None
 
     def account(self) -> AccountSnapshot:
         data = _mapping_data(self._call("account", {"account_id": self._account_id}), self.provider_name)
@@ -75,7 +75,7 @@ class KiteAdapter(ConfiguredAdapter):
             return tuple(Position(str(row["symbol"]), Decimal(str(row.get("quantity", row.get("qty", 0)))),
                           _decimal_or_none(row.get("average_price")), str(row.get("currency", "INR")), row.get("exchange")) for row in rows)
         except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
-            raise BrokerAdapterError("invalid_response", "positions response is malformed", provider=self.provider_name) from exc
+            raise BrokerAdapterError("invalid_response", "positions response is malformed", provider=self.provider_name) from None
 
     def submit_order(self, intent: OrderIntent) -> OrderReceipt:
         self._write_guard(intent)
@@ -109,8 +109,11 @@ class KiteAdapter(ConfiguredAdapter):
 
     def _cancel_order(self, broker_order_id: str, capability: _ExecutionCapability) -> OrderReceipt:
         order_id = self._require_id(broker_order_id)
-        if not isinstance(capability, _ExecutionCapability):
+        if capability is not self._execution_capability:
             raise self._direct_write_error()
+        if not self._live_enabled:
+            raise LiveExecutionDisabled(self.provider_name, direct=False)
+        self._assert_token_valid()
         response = self._call("cancel_order", {"account_id": self._account_id, "order_id": order_id}, write=True)
         return self._receipt(_mapping_data(response, self.provider_name), default_status="canceled")
 
@@ -186,7 +189,7 @@ def _as_datetime(value: Any, provider: str) -> datetime:
     try:
         result = value if isinstance(value, datetime) else datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except (TypeError, ValueError) as exc:
-        raise BrokerAdapterError("invalid_response", "quote response is missing a valid timestamp", provider=provider) from exc
+        raise BrokerAdapterError("invalid_response", "quote response is missing a valid timestamp", provider=provider) from None
     if result.tzinfo is None or result.utcoffset() is None:
         raise BrokerAdapterError("invalid_response", "quote timestamp must be timezone-aware", provider=provider)
     return result

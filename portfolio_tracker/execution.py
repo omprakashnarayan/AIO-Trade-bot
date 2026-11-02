@@ -11,6 +11,7 @@ from .db import Database
 from .paper_broker import PaperBroker, PaperExecutionResult
 from .risk import RiskDecision, RiskEngine
 from .trading_models import ExecutionMode, OrderIntent
+from .brokers.base import _mint_execution_capability
 
 
 class ExecutionError(Exception):
@@ -49,6 +50,15 @@ class ExecutionGateway:
             raise ValueError("provide only one of risk or risk_engine")
         self.risk = risk or risk_engine or RiskEngine(db=db)
         self.paper_broker = paper_broker or PaperBroker(db)
+        self._execution_capability = _mint_execution_capability()
+
+    def authorize_adapter(self, adapter: Any) -> Any:
+        """Bind this gateway's private capability to a live broker adapter."""
+        binder = getattr(adapter, "_bind_execution_capability", None)
+        if binder is None:
+            raise TypeError("adapter does not support gateway authorization")
+        binder(self._execution_capability)
+        return adapter
 
     def submit(
         self,
