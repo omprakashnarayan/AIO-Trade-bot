@@ -563,6 +563,8 @@ class Database:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT * FROM order_intents WHERE broker_id=? AND account_id IS ? AND portfolio_id IS ? AND idempotency_key=?", (broker_id, intent.account_id, intent.portfolio_id, storage_key)).fetchone()
             if row is not None:
+                if row["order_payload"] != payload:
+                    raise ValueError("conflicting order payload for reused idempotency key")
                 if audit_callback:
                     audit_callback(conn, "order.retry", "order_intent", str(row["id"]), intent, {"reused": True}, now)
                 self._append_audit_event_conn(conn, "order.retry", "order_intent", str(row["id"]), {"intent": intent.to_dict(), "reused": True}, broker_id, intent.account_id, intent.portfolio_id, intent.mode.value, now)

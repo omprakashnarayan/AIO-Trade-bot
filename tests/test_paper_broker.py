@@ -104,6 +104,19 @@ def test_retry_appends_audit_without_mutating_trade_state(tmp_path):
     assert [event["event_type"] for event in events] == ["order.filled", "order.retry"]
 
 
+def test_conflicting_retry_with_same_idempotency_key_is_rejected(tmp_path):
+    b = broker(tmp_path)
+    first = b.submit(intent(), price="100")
+    before = (len(b.db.list_order_intents()), len(b.db.list_fills()), len(b.db.list_cash_ledger()), len(b.db.list_audit_events()))
+
+    with pytest.raises(ValueError, match="conflicting order payload"):
+        b.submit(intent(qty="1"), price="100")
+
+    after = (len(b.db.list_order_intents()), len(b.db.list_fills()), len(b.db.list_cash_ledger()), len(b.db.list_audit_events()))
+    assert after == before
+    assert b.db.get_order_intent(order_id=first.order_id)["status"] == "filled"
+
+
 def test_decimal_precision_is_kept_in_paper_state(tmp_path):
     b = broker(tmp_path)
     b.submit(intent(qty="0.123456789123456789"), price="100.123456789123456789")
