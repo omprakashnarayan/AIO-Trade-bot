@@ -162,15 +162,18 @@ class OrderIntent:
     limit_price: Decimal | int | str | None = None
     stop_price: Decimal | int | str | None = None
     asset_class: AssetClass = AssetClass.EQUITY
+    broker_id: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "idempotency_key", _identifier(self.idempotency_key, "idempotency_key"))
         portfolio_id = _optional_identifier(self.portfolio_id, "portfolio_id")
         account_id = _optional_identifier(self.account_id, "account_id")
+        broker_id = _optional_identifier(self.broker_id, "broker_id")
         if portfolio_id is None and account_id is None:
             raise ValueError("portfolio_id or account_id is required")
         object.__setattr__(self, "portfolio_id", portfolio_id)
         object.__setattr__(self, "account_id", account_id)
+        object.__setattr__(self, "broker_id", broker_id)
         symbol = _symbol(self.symbol, "symbol")
         object.__setattr__(self, "symbol", symbol)
         object.__setattr__(self, "side", _enum(self.side, OrderSide, "side"))
@@ -198,7 +201,7 @@ class OrderIntent:
             raise ValueError(f"price fields do not match order_type {self.order_type.value}")
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "account_id": self.account_id,
             "asset_class": self.asset_class.value,
             "currency": self.currency,
@@ -213,6 +216,9 @@ class OrderIntent:
             "symbol": self.symbol,
             "time_in_force": self.time_in_force.value,
         }
+        if self.broker_id is not None:
+            result["broker_id"] = self.broker_id
+        return result
 
 
 def _string_decimal(value: Decimal | None) -> str | None:

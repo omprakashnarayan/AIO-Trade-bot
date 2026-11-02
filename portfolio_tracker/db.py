@@ -87,6 +87,15 @@ CREATE TABLE IF NOT EXISTS paper_transactions (
     side TEXT NOT NULL, shares TEXT NOT NULL CHECK (length(shares) > 0), price TEXT NOT NULL CHECK (length(price) > 0),
     currency TEXT NOT NULL, fees TEXT NOT NULL CHECK (length(fees) > 0), trade_date TEXT NOT NULL, notes TEXT DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS scheduler_state (
+    trigger_id TEXT PRIMARY KEY, last_scheduled_at TEXT, last_occurrence_index INTEGER NOT NULL DEFAULT -1,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS scheduler_runs (
+    trigger_id TEXT NOT NULL, scheduled_at TEXT NOT NULL, outcome TEXT NOT NULL,
+    created_at TEXT NOT NULL, PRIMARY KEY (trigger_id, scheduled_at)
+);
+CREATE INDEX IF NOT EXISTS idx_scheduler_runs_created ON scheduler_runs(created_at);
 """
 
 
@@ -439,6 +448,8 @@ class Database:
                 raise ValueError("intent dictionary is not a valid OrderIntent") from exc
         else:
             raise TypeError("intent must be an OrderIntent or a dictionary")
+        if validated.broker_id is not None and validated.broker_id != broker_id:
+            raise ValueError("broker_id does not match intent broker binding")
         payload = validated.to_dict()
         if status not in _ORDER_STATUSES:
             raise ValueError(f"status must be one of: {', '.join(sorted(_ORDER_STATUSES))}")

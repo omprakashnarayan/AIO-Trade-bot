@@ -70,6 +70,10 @@ class ExecutionGateway:
             raise LiveModeRejected(risk.message)
         if intent.mode is not ExecutionMode.PAPER:
             raise ExecutionError("unsupported execution mode")
+        if intent.broker_id is not None and intent.broker_id != self.paper_broker.broker_id:
+            risk = RiskDecision(False, "broker_mismatch", "intent broker is not bound to this paper gateway", {"expected": self.paper_broker.broker_id, "actual": intent.broker_id})
+            self._report(intent, "execution.routing_rejected", risk)
+            return ExecutionDecision("rejected", risk, error=risk.message)
         risk = self.risk.check(
             intent,
             quote_price=quote_price,
