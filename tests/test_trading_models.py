@@ -173,6 +173,12 @@ def test_identifiers_reject_leading_and_trailing_unicode_disallowed_characters(v
         make_intent(idempotency_key=value)
 
 
+@pytest.mark.parametrize("value", [" intent-001", "intent-001 "])
+def test_identifiers_reject_leading_and_trailing_ascii_spaces(value):
+    with pytest.raises(ValueError):
+        make_intent(idempotency_key=value)
+
+
 def test_symbol_case_expansion_is_bounded_after_normalization():
     with pytest.raises(ValueError):
         make_intent(symbol="ß" * 65)
@@ -207,6 +213,21 @@ def test_trade_proposal_id_uses_bounded_identifier_validation(value):
 @pytest.mark.parametrize("field", ["strategy", "rationale"])
 @pytest.mark.parametrize("value", ["bad\nvalue", "bad\u200bvalue", "bad\u2003value", "\u2003strategy", "strategy\u2003", "\u0001strategy", "strategy\u0001"])
 def test_trade_proposal_text_rejects_controls_formats_and_unicode_separators(field, value):
+    values = {"strategy": "mean-reversion-v1", "rationale": "Test proposal"}
+    values[field] = value
+    with pytest.raises(ValueError):
+        TradeProposal(
+            proposal_id="proposal-001",
+            intent=make_intent(),
+            strategy=values["strategy"],
+            rationale=values["rationale"],
+            expires_at=datetime(2026, 11, 2, 12, 0, tzinfo=timezone.utc),
+        )
+
+
+@pytest.mark.parametrize("field", ["strategy", "rationale"])
+@pytest.mark.parametrize("value", [" strategy", "strategy "])
+def test_trade_proposal_text_rejects_leading_and_trailing_ascii_spaces(field, value):
     values = {"strategy": "mean-reversion-v1", "rationale": "Test proposal"}
     values[field] = value
     with pytest.raises(ValueError):

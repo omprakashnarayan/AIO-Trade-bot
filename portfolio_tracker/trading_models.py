@@ -65,7 +65,8 @@ def _required_text(value: str, field_name: str, *, max_length: int) -> str:
         category = unicodedata.category(character)
         if category in {"Cc", "Cf", "Cs"} or category.startswith("Z") and character != " ":
             raise ValueError(f"{field_name} must not contain control, format, or Unicode separator characters")
-    value = value.strip(" ")
+    if value.startswith(" ") or value.endswith(" "):
+        raise ValueError(f"{field_name} must not contain leading or trailing spaces")
     if not value:
         raise ValueError(f"{field_name} must be non-empty")
     if len(value) > max_length:
@@ -80,9 +81,9 @@ def _identifier(value: str, field_name: str, *, allow_edge_ascii_spaces: bool = 
         category = unicodedata.category(character)
         if category in {"Cc", "Cf", "Cs"} or category.startswith("Z") and character != " ":
             raise ValueError(f"{field_name} must not contain control, format, or separator characters")
-    if not allow_edge_ascii_spaces and (value.startswith(" ") or value.endswith(" ")):
+    if value.startswith(" ") or value.endswith(" "):
         raise ValueError(f"{field_name} must not contain leading or trailing spaces")
-    result = value.strip(" ")
+    result = value
     if not result:
         raise ValueError(f"{field_name} must be non-empty")
     if " " in result:
