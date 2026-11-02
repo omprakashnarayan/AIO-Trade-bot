@@ -51,44 +51,56 @@ class TimeInForce(_ValueEnum):
 
 _ALLOWED_CURRENCIES = frozenset({"USD", "INR"})
 _MAX_IDENTIFIER_LENGTH = 128
+_MAX_STRATEGY_LENGTH = 128
+_MAX_RATIONALE_LENGTH = 4096
 _MAX_DECIMAL_DIGITS = 38
 _MAX_DECIMAL_EXPONENT = 18
 _MAX_DECIMAL_SERIALIZED_LENGTH = 64
 
 
-def _required_text(value: str, field_name: str) -> str:
+def _required_text(value: str, field_name: str, *, max_length: int) -> str:
     if not isinstance(value, str):
         raise TypeError(f"{field_name} must be a string")
-    value = value.strip()
+    for character in value:
+        category = unicodedata.category(character)
+        if category in {"Cc", "Cf", "Cs"} or category.startswith("Z") and character != " ":
+            raise ValueError(f"{field_name} must not contain control, format, or Unicode separator characters")
+    value = value.strip(" ")
     if not value:
         raise ValueError(f"{field_name} must be non-empty")
+    if len(value) > max_length:
+        raise ValueError(f"{field_name} must be at most {max_length} characters")
     return value
 
 
-def _identifier(value: str, field_name: str) -> str:
+def _identifier(value: str, field_name: str, *, allow_edge_ascii_spaces: bool = True) -> str:
     if not isinstance(value, str):
         raise TypeError(f"{field_name} must be a string")
-    result = value.strip()
+    for character in value:
+        category = unicodedata.category(character)
+        if category in {"Cc", "Cf", "Cs"} or category.startswith("Z") and character != " ":
+            raise ValueError(f"{field_name} must not contain control, format, or separator characters")
+    if not allow_edge_ascii_spaces and (value.startswith(" ") or value.endswith(" ")):
+        raise ValueError(f"{field_name} must not contain leading or trailing spaces")
+    result = value.strip(" ")
     if not result:
         raise ValueError(f"{field_name} must be non-empty")
-    if any(unicodedata.category(character) in {"Cc", "Cf", "Cs"} or unicodedata.category(character).startswith("Z") for character in result):
-        raise ValueError(f"{field_name} must not contain control, format, or separator characters")
+    if " " in result:
+        raise ValueError(f"{field_name} must not contain spaces")
     if len(result) > _MAX_IDENTIFIER_LENGTH:
         raise ValueError(f"{field_name} must be at most {_MAX_IDENTIFIER_LENGTH} characters")
     return result
 
 
 def _symbol(value: str, field_name: str) -> str:
-    result = unicodedata.normalize("NFKC", _identifier(value, field_name)).upper()
-    if len(result) > _MAX_IDENTIFIER_LENGTH:
-        raise ValueError(f"{field_name} must be at most {_MAX_IDENTIFIER_LENGTH} characters")
-    return result
+    normalized = unicodedata.normalize("NFKC", value).upper() if isinstance(value, str) else value
+    return _identifier(normalized, field_name, allow_edge_ascii_spaces=False)
 
 
 def _optional_text(value: str | None, field_name: str) -> str | None:
     if value is None:
         return None
-    return _required_text(value, field_name)
+    return _required_text(value, field_name, max_length=_MAX_RATIONALE_LENGTH)
 
 
 def _optional_identifier(value: str | None, field_name: str) -> str | None:
@@ -218,8 +230,8 @@ class TradeProposal:
         object.__setattr__(self, "proposal_id", _identifier(self.proposal_id, "proposal_id"))
         if not isinstance(self.intent, OrderIntent):
             raise TypeError("intent must be an OrderIntent")
-        object.__setattr__(self, "strategy", _required_text(self.strategy, "strategy"))
-        object.__setattr__(self, "rationale", _required_text(self.rationale, "rationale"))
+        object.__setattr__(self, "strategy", _required_text(self.strategy, "strategy", max_length=_MAX_STRATEGY_LENGTH))
+        object.__setattr__(self, "rationale", _required_text(self.rationale, "rationale", max_length=_MAX_RATIONALE_LENGTH))
         object.__setattr__(self, "expires_at", _iso_datetime(self.expires_at, "expires_at"))
 
     def to_dict(self) -> dict[str, Any]:

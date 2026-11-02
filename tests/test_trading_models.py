@@ -161,6 +161,18 @@ def test_identifiers_reject_unicode_format_and_separator_characters(value):
         make_intent(idempotency_key=value)
 
 
+@pytest.mark.parametrize("value", ["\u2003INFY", "INFY\u2003", "\u0001INFY", "INFY\u0001"])
+def test_symbols_reject_disallowed_edges_after_normalization(value):
+    with pytest.raises(ValueError):
+        make_intent(symbol=value)
+
+
+@pytest.mark.parametrize("value", ["\u2003intent-001", "intent-001\u2003", "\u0001intent-001", "intent-001\u0001"])
+def test_identifiers_reject_leading_and_trailing_unicode_disallowed_characters(value):
+    with pytest.raises(ValueError):
+        make_intent(idempotency_key=value)
+
+
 def test_symbol_case_expansion_is_bounded_after_normalization():
     with pytest.raises(ValueError):
         make_intent(symbol="ß" * 65)
@@ -172,6 +184,14 @@ def test_decimal_values_are_bounded_for_precision_and_exponent(value):
         make_intent(quantity=value)
 
 
+@pytest.mark.parametrize("field", ["limit_price", "stop_price"])
+@pytest.mark.parametrize("value", [Decimal("1e19"), Decimal("1e-19"), Decimal("9" * 39)])
+def test_order_price_decimals_are_bounded(field, value):
+    order_type = OrderType.LIMIT if field == "limit_price" else OrderType.STOP
+    with pytest.raises(ValueError):
+        make_intent(order_type=order_type, limit_price=value if field == "limit_price" else None, stop_price=value if field == "stop_price" else None)
+
+
 @pytest.mark.parametrize("value", ["", "  ", "bad\nvalue", "x" * 129])
 def test_trade_proposal_id_uses_bounded_identifier_validation(value):
     with pytest.raises((TypeError, ValueError)):
@@ -180,6 +200,35 @@ def test_trade_proposal_id_uses_bounded_identifier_validation(value):
             intent=make_intent(),
             strategy="mean-reversion-v1",
             rationale="Test proposal",
+            expires_at=datetime(2026, 11, 2, 12, 0, tzinfo=timezone.utc),
+        )
+
+
+@pytest.mark.parametrize("field", ["strategy", "rationale"])
+@pytest.mark.parametrize("value", ["bad\nvalue", "bad\u200bvalue", "bad\u2003value", "\u2003strategy", "strategy\u2003", "\u0001strategy", "strategy\u0001"])
+def test_trade_proposal_text_rejects_controls_formats_and_unicode_separators(field, value):
+    values = {"strategy": "mean-reversion-v1", "rationale": "Test proposal"}
+    values[field] = value
+    with pytest.raises(ValueError):
+        TradeProposal(
+            proposal_id="proposal-001",
+            intent=make_intent(),
+            strategy=values["strategy"],
+            rationale=values["rationale"],
+            expires_at=datetime(2026, 11, 2, 12, 0, tzinfo=timezone.utc),
+        )
+
+
+@pytest.mark.parametrize("field,max_length", [("strategy", 128), ("rationale", 4096)])
+def test_trade_proposal_text_is_bounded(field, max_length):
+    values = {"strategy": "mean-reversion-v1", "rationale": "Test proposal"}
+    values[field] = "x" * (max_length + 1)
+    with pytest.raises(ValueError):
+        TradeProposal(
+            proposal_id="proposal-001",
+            intent=make_intent(),
+            strategy=values["strategy"],
+            rationale=values["rationale"],
             expires_at=datetime(2026, 11, 2, 12, 0, tzinfo=timezone.utc),
         )
 
@@ -209,6 +258,22 @@ def test_invalid_fill_values_are_rejected(field, value):
     }
     values[field] = value
     with pytest.raises((TypeError, ValueError)):
+        Fill(**values)
+
+
+@pytest.mark.parametrize("field", ["quantity", "price"])
+@pytest.mark.parametrize("value", [Decimal("1e19"), Decimal("1e-19"), Decimal("9" * 39)])
+def test_fill_decimals_are_bounded(field, value):
+    values = {
+        "fill_id": "fill-001",
+        "intent_idempotency_key": "intent-001",
+        "quantity": Decimal("2"),
+        "price": Decimal("1500.25"),
+        "currency": "INR",
+        "filled_at": datetime(2026, 11, 2, 12, 0, tzinfo=timezone.utc),
+    }
+    values[field] = value
+    with pytest.raises(ValueError):
         Fill(**values)
 
 
