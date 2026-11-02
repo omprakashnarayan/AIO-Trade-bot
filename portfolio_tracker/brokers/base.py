@@ -33,12 +33,10 @@ class AdapterConfigurationError(ValueError):
 
 
 class LiveExecutionDisabled(BrokerAdapterError):
-    """Direct adapter writes are disabled; a gateway capability is required."""
+    """Live adapter writes are disabled until a real gateway is integrated."""
 
-    def __init__(self, provider: str, *, direct: bool = True) -> None:
-        code = "live_gateway_required" if direct else "live_disabled"
-        message = "LIVE execution requires the internal ExecutionGateway capability" if direct else "LIVE execution is disabled by configuration"
-        super().__init__(code, message, provider=provider)
+    def __init__(self, provider: str) -> None:
+        super().__init__("live_execution_not_enabled", "live execution not enabled", provider=provider)
 
 
 class AdapterCapability(str, Enum):
@@ -179,23 +177,6 @@ class Transport(Protocol):
     def __call__(self, operation: str, payload: Mapping[str, Any]) -> Mapping[str, Any]: ...
 
 
-_CAPABILITY_NONCE = object()
-
-
-class _ExecutionCapability:
-    """Opaque capability whose exact instance is bound by ExecutionGateway."""
-    __slots__ = ("_nonce",)
-
-    def __init__(self, nonce: object) -> None:
-        if nonce is not _CAPABILITY_NONCE:
-            raise TypeError("execution capabilities are minted by ExecutionGateway")
-        self._nonce = nonce
-
-
-def _mint_execution_capability() -> _ExecutionCapability:
-    return _ExecutionCapability(_CAPABILITY_NONCE)
-
-
 def require_intent(intent: OrderIntent) -> OrderIntent:
     if not isinstance(intent, OrderIntent):
         raise TypeError("broker adapters accept only a validated OrderIntent")
@@ -223,7 +204,6 @@ class ConfiguredAdapter:
         self._live_enabled = live_enabled
         self._transport = transport
         self._token_expiry = token_expiry
-        self._execution_capability: _ExecutionCapability | None = None
         self._secrets = tuple(secret for secret in secrets if isinstance(secret, str) and secret)
         mode = "live" if live_enabled else "paper/read_only"
         self.metadata = BrokerMetadata(self.provider_name, account_id, broker_id, mode, capabilities, token_expiry=token_expiry)
@@ -234,9 +214,7 @@ class ConfiguredAdapter:
 
     def _call(self, operation: str, payload: Mapping[str, Any], *, write: bool = False) -> Mapping[str, Any]:
         if write:
-            if not self._live_enabled:
-                raise LiveExecutionDisabled(self.provider_name, direct=False)
-            self._assert_token_valid()
+            raise LiveExecutionDisabled(self.provider_name)
         if self._transport is None:
             raise BrokerAdapterError("transport_unconfigured", "no injectable transport is configured", provider=self.provider_name)
         try:
@@ -280,33 +258,11 @@ class ConfiguredAdapter:
             current = TokenExpiryMetadata(expiry.expires_at, True)
             raise BrokerAdapterError("token_expired", "access token is expired", provider=self.provider_name, token_expiry=current)
 
-    def _bind_execution_capability(self, capability: _ExecutionCapability) -> None:
-        if not isinstance(capability, _ExecutionCapability):
-            raise TypeError("invalid execution capability")
-        self._execution_capability = capability
-
     def _write_guard(self, intent: OrderIntent) -> OrderIntent:
         require_intent(intent)
         if intent.mode.value == "paper":
             raise BrokerAdapterError("paper_requires_gateway", "route PAPER intents through ExecutionGateway/PaperBroker", provider=self.provider_name)
-        if intent.account_id != self._account_id:
-            raise BrokerAdapterError("account_mismatch", "order account does not match adapter account", provider=self.provider_name)
-        if not self._live_enabled:
-            raise LiveExecutionDisabled(self.provider_name, direct=False)
         raise LiveExecutionDisabled(self.provider_name)
-
-    def _authorized_write(self, intent: OrderIntent, capability: object) -> OrderIntent:
-        require_intent(intent)
-        if capability is not self._execution_capability:
-            raise LiveExecutionDisabled(self.provider_name)
-        if intent.mode.value == "paper":
-            raise BrokerAdapterError("paper_requires_gateway", "route PAPER intents through ExecutionGateway/PaperBroker", provider=self.provider_name)
-        if intent.account_id != self._account_id:
-            raise BrokerAdapterError("account_mismatch", "order account does not match adapter account", provider=self.provider_name)
-        if not self._live_enabled:
-            raise LiveExecutionDisabled(self.provider_name, direct=False)
-        self._assert_token_valid()
-        return intent
 
     @staticmethod
     def _require_id(value: str, field_name: str = "broker_order_id") -> str:

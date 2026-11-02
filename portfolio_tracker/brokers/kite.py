@@ -1,4 +1,4 @@
-"""Kite Connect adapter boundary; live writes require an internal gateway capability."""
+"""Kite Connect adapter boundary; live writes are disabled."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from typing import Any, Mapping
 from .base import (
     AdapterCapability, AdapterConfigurationError, BrokerAdapterError, ConfiguredAdapter,
     LiveExecutionDisabled, OrderReceipt, Position, Quote, AccountSnapshot, ReconciliationReport,
-    TokenExpiryMetadata, normalize_status, require_intent, _ExecutionCapability,
+    TokenExpiryMetadata, normalize_status, require_intent,
 )
 from ..trading_models import OrderIntent, OrderType
 
@@ -81,12 +81,6 @@ class KiteAdapter(ConfiguredAdapter):
         self._write_guard(intent)
         raise AssertionError("unreachable")
 
-    def _submit_order(self, intent: OrderIntent, capability: _ExecutionCapability) -> OrderReceipt:
-        intent = self._authorized_write(intent, capability)
-        payload = self._payload(intent)
-        response = self._call("submit_order", payload, write=True)
-        return self._receipt(_mapping_data(response, self.provider_name))
-
     def _payload(self, intent: OrderIntent) -> dict[str, Any]:
         provider_symbol = self.map_symbol(intent.symbol)
         order_type = {OrderType.MARKET: "MARKET", OrderType.LIMIT: "LIMIT", OrderType.STOP: "SL-M", OrderType.STOP_LIMIT: "SL"}[intent.order_type]
@@ -104,18 +98,8 @@ class KiteAdapter(ConfiguredAdapter):
         }
 
     def cancel_order(self, broker_order_id: str) -> OrderReceipt:
-        order_id = self._require_id(broker_order_id)
-        raise self._direct_write_error()
-
-    def _cancel_order(self, broker_order_id: str, capability: _ExecutionCapability) -> OrderReceipt:
-        order_id = self._require_id(broker_order_id)
-        if capability is not self._execution_capability:
-            raise self._direct_write_error()
-        if not self._live_enabled:
-            raise LiveExecutionDisabled(self.provider_name, direct=False)
-        self._assert_token_valid()
-        response = self._call("cancel_order", {"account_id": self._account_id, "order_id": order_id}, write=True)
-        return self._receipt(_mapping_data(response, self.provider_name), default_status="canceled")
+        self._require_id(broker_order_id)
+        raise LiveExecutionDisabled(self.provider_name)
 
     def order_status(self, broker_order_id: str) -> OrderReceipt:
         order_id = self._require_id(broker_order_id)
@@ -138,10 +122,6 @@ class KiteAdapter(ConfiguredAdapter):
 
     def get_order_status(self, broker_order_id: str) -> OrderReceipt:
         return self.order_status(broker_order_id)
-
-    def _direct_write_error(self) -> LiveExecutionDisabled:
-        return LiveExecutionDisabled(self.provider_name, direct=self._live_enabled)
-
 
 def _validate_common_config(account_id: str, credential: str, broker_id: str, access_token: str | None,
                             live_enabled: bool, token_expires_at: datetime | None) -> None:

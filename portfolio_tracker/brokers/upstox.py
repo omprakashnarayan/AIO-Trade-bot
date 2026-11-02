@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from .base import AdapterConfigurationError, OrderReceipt, _ExecutionCapability
+from .base import AdapterConfigurationError
 from .kite import KiteAdapter, KiteConfig, _validate_common_config, _validate_exchange_symbols
 from ..trading_models import OrderIntent, OrderType
 
@@ -58,13 +58,6 @@ class UpstoxAdapter(KiteAdapter):
             "time_in_force": intent.time_in_force.value, "validity": intent.time_in_force.value.upper(),
             "idempotency_key": intent.idempotency_key, "client_order_id": intent.idempotency_key,
         }
-
-    def _submit_order(self, intent: OrderIntent, capability: _ExecutionCapability) -> OrderReceipt:
-        return super()._submit_order(intent, capability)
-
-    def _cancel_order(self, broker_order_id: str, capability: _ExecutionCapability) -> OrderReceipt:
-        return super()._cancel_order(broker_order_id, capability)
-
 
 def _decimal_text(value: Any) -> str | None:
     return None if value is None else format(value, "f")
