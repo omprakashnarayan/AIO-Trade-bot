@@ -14,7 +14,8 @@ from typing import Any, Iterable, Mapping, TextIO
 
 from ..db import Database
 
-_DEFAULT_PORTFOLIO = "INDmoney US"
+INDMONEY_US_PORTFOLIO = "INDmoney-US"
+_DEFAULT_PORTFOLIO = INDMONEY_US_PORTFOLIO
 _REQUIRED = ("symbol", "shares", "average_cost")
 _ALIASES = {"avg_cost": "average_cost", "average cost": "average_cost", "ticker": "symbol"}
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._:/-]{0,127}$")
@@ -78,7 +79,7 @@ def _timestamp(value: Any) -> str:
 
 def _portfolio(value: Any) -> str:
     result = _identifier(value, "portfolio", _DEFAULT_PORTFOLIO)
-    if result not in {_DEFAULT_PORTFOLIO, "INDmoney-US"} and not result.startswith("INDmoney-US:"):
+    if result != INDMONEY_US_PORTFOLIO:
         raise ValueError("INDmoney imports must target the dedicated INDmoney US portfolio")
     return result
 
@@ -187,11 +188,7 @@ def import_indmoney_records(db: Database, records: Iterable[Mapping[str, Any] | 
                 if existing["row_payload"] != encoded:
                     raise ValueError(f"conflicting replay for import key {key}")
                 skipped += 1; accepted.append(key); continue
-            old = conn.execute("SELECT currency FROM holdings WHERE portfolio=? AND symbol=?", (row.portfolio, row.symbol)).fetchone()
-            if old and old["currency"].upper() != "USD":
-                raise ValueError(f"existing non-USD holding conflicts with {row.portfolio}/{row.symbol}")
             db.upsert_indmoney_holding_conn(conn, portfolio=row.portfolio, symbol=row.symbol, label=row.label, account=row.account, shares=row.shares, avg_cost=row.average_cost, source=row.source, source_imported_at=row.imported_at, ingested_at=ingested_at)
-            conn.execute("INSERT INTO holdings(portfolio,symbol,label,currency,shares,avg_cost,notes,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(portfolio,symbol) DO UPDATE SET label=excluded.label,currency=excluded.currency,shares=excluded.shares,avg_cost=excluded.avg_cost,notes=excluded.notes,updated_at=excluded.updated_at", (row.portfolio, row.symbol, row.label, "USD", float(row.shares), float(row.average_cost), f"INDmoney import; account={row.account}; source={row.source}", ingested_at))
             conn.execute("INSERT INTO indmoney_import_rows(import_key,portfolio,symbol,row_payload,imported_at,ingested_at,source) VALUES(?,?,?,?,?,?,?)", (key, row.portfolio, row.symbol, encoded, row.imported_at, ingested_at, row.source))
             conn.execute("INSERT INTO audit_events(event_type,entity_type,entity_id,portfolio_id,payload,occurred_at,created_at) VALUES(?,?,?,?,?,?,?)", ("indmoney.imported", "indmoney_import_row", key, row.portfolio, json.dumps({**payload, "imported_at": row.imported_at, "ingested_at": ingested_at}, sort_keys=True, separators=(",", ":")), row.imported_at, ingested_at))
             imported += 1; accepted.append(key)

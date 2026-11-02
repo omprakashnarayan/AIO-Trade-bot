@@ -8,7 +8,7 @@ from pathlib import Path
 from .config import load_settings, save_settings
 from .db import Database
 from .reporting import generate_report
-from .imports.indmoney import import_indmoney_csv, import_indmoney_records
+from .imports.indmoney import INDMONEY_US_PORTFOLIO, import_indmoney_csv, import_indmoney_records
 from .web import main as run_web
 
 
@@ -138,7 +138,7 @@ def build_parser() -> argparse.ArgumentParser:
     source.add_argument("--csv", help="CSV path or CSV text")
     source.add_argument("--records", help="JSON array or JSON file of manual records")
     p.add_argument("--source", default="indmoney-manual", help="provenance source label")
-    p.add_argument("--portfolio", default="INDmoney US", help="dedicated INDmoney US portfolio")
+    p.add_argument("--portfolio", choices=[INDMONEY_US_PORTFOLIO], default=INDMONEY_US_PORTFOLIO, help="dedicated INDmoney US portfolio")
     p.set_defaults(func=cmd_import_indmoney)
 
     sub.add_parser("list", help="list holdings").set_defaults(func=cmd_list)
