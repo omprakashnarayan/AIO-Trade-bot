@@ -2,17 +2,18 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from enum import Enum
-from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
+import re
+from typing import Any, Mapping, Protocol, runtime_checkable
 
 from ..trading_models import OrderIntent
 
 
 class BrokerAdapterError(Exception):
-    """Normalized provider error; never includes credentials or raw auth headers."""
+    """Normalized provider error that never exposes credentials."""
 
     def __init__(self, code: str, message: str, *, provider: str, retryable: bool = False,
                  status: str | None = None, rate_limit: "RateLimitMetadata | None" = None,
@@ -32,10 +33,12 @@ class AdapterConfigurationError(ValueError):
 
 
 class LiveExecutionDisabled(BrokerAdapterError):
-    """Live execution is disabled unless explicitly enabled in provider config."""
+    """Direct adapter writes are disabled; a gateway capability is required."""
 
-    def __init__(self, provider: str) -> None:
-        super().__init__("live_disabled", "LIVE execution is disabled by configuration", provider=provider)
+    def __init__(self, provider: str, *, direct: bool = True) -> None:
+        code = "live_gateway_required" if direct else "live_disabled"
+        message = "LIVE execution requires the internal ExecutionGateway capability" if direct else "LIVE execution is disabled by configuration"
+        super().__init__(code, message, provider=provider)
 
 
 class AdapterCapability(str, Enum):
@@ -149,7 +152,6 @@ def _to_public_dict(value: Any) -> Any:
 
 
 def normalize_status(value: Any) -> OrderStatus:
-    """Map common provider statuses to the internal status vocabulary."""
     text = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
     mapping = {
         "open": OrderStatus.SUBMITTED, "trigger_pending": OrderStatus.PENDING,
@@ -177,6 +179,16 @@ class Transport(Protocol):
     def __call__(self, operation: str, payload: Mapping[str, Any]) -> Mapping[str, Any]: ...
 
 
+class _ExecutionCapability:
+    """Opaque marker; no public constructor or exported bypass exists."""
+    __slots__ = ()
+
+
+# Deliberately private: the not-yet-implemented live gateway is the only future owner.
+def _gateway_capability() -> _ExecutionCapability:
+    return _ExecutionCapability()
+
+
 def require_intent(intent: OrderIntent) -> OrderIntent:
     if not isinstance(intent, OrderIntent):
         raise TypeError("broker adapters accept only a validated OrderIntent")
@@ -188,18 +200,11 @@ def utc_now() -> datetime:
 
 
 class ConfiguredAdapter:
-    """Shared mechanics for official API adapters.
-
-    The transport is deliberately injectable. No HTTP client is created here,
-    and paper intents are left to ExecutionGateway/PaperBroker so risk cannot
-    be bypassed by calling an adapter directly.
-    """
-
     provider_name: str
 
     def __init__(self, *, account_id: str, broker_id: str, live_enabled: bool = False,
                  transport: Transport | None = None, token_expiry: TokenExpiryMetadata | None = None,
-                 capabilities: frozenset[AdapterCapability]) -> None:
+                 secrets: tuple[str, ...] = (), capabilities: frozenset[AdapterCapability]) -> None:
         if not isinstance(account_id, str) or not account_id.strip():
             raise AdapterConfigurationError("account_id must be non-empty")
         if not isinstance(broker_id, str) or not broker_id.strip():
@@ -211,6 +216,7 @@ class ConfiguredAdapter:
         self._live_enabled = live_enabled
         self._transport = transport
         self._token_expiry = token_expiry
+        self._secrets = tuple(secret for secret in secrets if isinstance(secret, str) and secret)
         mode = "live" if live_enabled else "paper/read_only"
         self.metadata = BrokerMetadata(self.provider_name, account_id, broker_id, mode, capabilities, token_expiry=token_expiry)
 
@@ -219,14 +225,18 @@ class ConfiguredAdapter:
         return self._live_enabled
 
     def _call(self, operation: str, payload: Mapping[str, Any], *, write: bool = False) -> Mapping[str, Any]:
-        if write and not self._live_enabled:
-            raise LiveExecutionDisabled(self.provider_name)
+        if write:
+            if not self._live_enabled:
+                raise LiveExecutionDisabled(self.provider_name, direct=False)
+            self._assert_token_valid()
         if self._transport is None:
             raise BrokerAdapterError("transport_unconfigured", "no injectable transport is configured", provider=self.provider_name)
         try:
             result = self._transport(operation, dict(payload))
-        except BrokerAdapterError:
-            raise
+        except BrokerAdapterError as exc:
+            raise BrokerAdapterError(exc.code, self._redact(exc.message), provider=self.provider_name,
+                                     retryable=exc.retryable, status=exc.status,
+                                     rate_limit=exc.rate_limit, token_expiry=exc.token_expiry) from exc
         except Exception as exc:
             raise BrokerAdapterError("transport_error", "provider transport failed", provider=self.provider_name, retryable=True) from exc
         if not isinstance(result, Mapping):
@@ -237,28 +247,65 @@ class ConfiguredAdapter:
         return result
 
     def _normalize_error(self, error: Any, response: Mapping[str, Any] | None = None) -> BrokerAdapterError:
-        response = response or {}
         if isinstance(error, Mapping):
             code = str(error.get("code") or error.get("error_type") or "provider_error")
             message = str(error.get("message") or error.get("description") or "provider request failed")
             provider_status = error.get("status")
         else:
             code, message, provider_status = "provider_error", str(error), None
-        return BrokerAdapterError(code, message, provider=self.provider_name,
+        return BrokerAdapterError(self._redact(code), self._redact(message), provider=self.provider_name,
                                   retryable=code in {"rate_limit", "timeout", "temporarily_unavailable"},
-                                  status=str(provider_status) if provider_status is not None else None,
+                                  status=self._redact(str(provider_status)) if provider_status is not None else None,
                                   rate_limit=self.metadata.rate_limit, token_expiry=self.metadata.token_expiry)
+
+    def _redact(self, value: str) -> str:
+        result = value
+        for secret in self._secrets:
+            result = result.replace(secret, "[REDACTED]")
+        result = re.sub(r"(?i)bearer\s+[A-Za-z0-9._~+/=-]+", "Bearer [REDACTED]", result)
+        result = re.sub(r"(?i)(access[_-]?token|api[_-]?key|client[_-]?secret|password)\s*[=:]\s*[^\s,;]+", r"\1=[REDACTED]", result)
+        return result
+
+    def _assert_token_valid(self) -> None:
+        expiry = self._token_expiry
+        if expiry and expiry.expired:
+            raise BrokerAdapterError("token_expired", "access token is expired", provider=self.provider_name, token_expiry=expiry)
 
     def _write_guard(self, intent: OrderIntent) -> OrderIntent:
         require_intent(intent)
         if intent.mode.value == "paper":
             raise BrokerAdapterError("paper_requires_gateway", "route PAPER intents through ExecutionGateway/PaperBroker", provider=self.provider_name)
+        if intent.account_id != self._account_id:
+            raise BrokerAdapterError("account_mismatch", "order account does not match adapter account", provider=self.provider_name)
         if not self._live_enabled:
+            raise LiveExecutionDisabled(self.provider_name, direct=False)
+        raise LiveExecutionDisabled(self.provider_name)
+
+    def _authorized_write(self, intent: OrderIntent, capability: object) -> OrderIntent:
+        require_intent(intent)
+        if not isinstance(capability, _ExecutionCapability):
             raise LiveExecutionDisabled(self.provider_name)
+        if intent.mode.value == "paper":
+            raise BrokerAdapterError("paper_requires_gateway", "route PAPER intents through ExecutionGateway/PaperBroker", provider=self.provider_name)
+        if intent.account_id != self._account_id:
+            raise BrokerAdapterError("account_mismatch", "order account does not match adapter account", provider=self.provider_name)
+        if not self._live_enabled:
+            raise LiveExecutionDisabled(self.provider_name, direct=False)
+        self._assert_token_valid()
         return intent
 
     @staticmethod
     def _require_id(value: str, field_name: str = "broker_order_id") -> str:
         if not isinstance(value, str) or not value.strip():
-            raise ValueError(f"{field_name} must be non-empty")
+            raise BrokerAdapterError("invalid_request", f"{field_name} must be non-empty", provider="adapter")
         return value
+
+    def _receipt(self, data: Any, *, default_status: str = "submitted") -> OrderReceipt:
+        if not isinstance(data, Mapping):
+            raise BrokerAdapterError("invalid_response", "provider order response is malformed", provider=self.provider_name)
+        order_id = data.get("order_id") or data.get("orderId") or data.get("order_id_text")
+        if not isinstance(order_id, str) or not order_id.strip():
+            raise BrokerAdapterError("invalid_response", "provider order response has no order ID", provider=self.provider_name)
+        status = data.get("status", default_status)
+        return OrderReceipt(order_id, normalize_status(status), str(status) if status is not None else None,
+                            self._redact(str(data["message"])) if data.get("message") is not None else None)
