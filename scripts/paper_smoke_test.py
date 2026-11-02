@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from decimal import Decimal
 from pathlib import Path
@@ -119,6 +120,33 @@ def run() -> None:
 
         events = db.list_audit_events()
         event_names = [row["event_type"] for row in events]
+        audit_records = [
+            (row["event_type"], row["entity_id"], json.loads(row["payload"]))
+            for row in events
+        ]
+        assert any(
+            event_type == "order.filled"
+            and payload.get("intent", {}).get("idempotency_key") == "smoke-buy-1"
+            and payload.get("intent", {}).get("side") == "buy"
+            for event_type, _, payload in audit_records
+        ), "audit trail missing successful buy outcome"
+        assert any(
+            event_type == "order.retry"
+            and payload.get("intent", {}).get("idempotency_key") == "smoke-buy-1"
+            and payload.get("reused") is True
+            for event_type, _, payload in audit_records
+        ), "audit trail missing identical retry outcome"
+        assert any(
+            event_type == "execution.risk_rejected"
+            and payload.get("decision", {}).get("code") == "conflicting_idempotency"
+            for event_type, _, payload in audit_records
+        ), "audit trail missing conflicting-key rejection outcome"
+        assert any(
+            event_type == "order.filled"
+            and payload.get("intent", {}).get("idempotency_key") == "smoke-sell-1"
+            and payload.get("intent", {}).get("side") == "sell"
+            for event_type, _, payload in audit_records
+        ), "audit trail missing sell outcome"
         print("paper smoke test: PASS")
         print("orders=2 fills=2 cash=9910.000000000000000000 INR position=INFY:1")
         print(f"audit_events={len(events)} events={','.join(event_names)}")

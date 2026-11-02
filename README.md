@@ -14,6 +14,8 @@ A local portfolio tracker with a paper-first trading foundation. The project kee
 
 No smoke test or paper execution path uses a network, live adapter, broker credential, or configured production database.
 
+No US execution broker/API has been selected or configured; INDmoney is read-only for this project.
+
 ## Setup and tests
 
 From the repository root:
