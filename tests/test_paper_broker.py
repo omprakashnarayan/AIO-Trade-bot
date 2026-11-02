@@ -93,6 +93,25 @@ def test_broker_identity_isolation(tmp_path):
     assert len(db.list_order_intents()) == 2
 
 
+def test_broker_identity_isolates_cash_holdings_and_transactions(tmp_path):
+    db = Database(tmp_path / "db.sqlite")
+    first = PaperBroker(db, broker_id="broker-a")
+    second = PaperBroker(db, broker_id="broker-b")
+    first.seed_cash("1000", currency="INR", account_id="acct", portfolio_id="p1")
+    second.seed_cash("2000", currency="INR", account_id="acct", portfolio_id="p1")
+
+    first.submit(intent("a"), price="100")
+    second.submit(intent("b"), price="200")
+
+    assert db.get_cash_balance(currency="INR", account_id="acct", portfolio_id="p1", broker_id="broker-a")["balance"] == "800.000000000000000000"
+    assert db.get_cash_balance(currency="INR", account_id="acct", portfolio_id="p1", broker_id="broker-b")["balance"] == "1600.000000000000000000"
+    assert db.get_paper_holding(broker_id="broker-a", portfolio="p1", symbol="INFY")["shares"] == "2"
+    assert db.get_paper_holding(broker_id="broker-b", portfolio="p1", symbol="INFY")["shares"] == "2"
+    assert len(db.list_cash_ledger(broker_id="broker-a")) == 1
+    assert len(db.list_cash_ledger(broker_id="broker-b")) == 1
+    assert [row["broker_id"] for row in db.list_paper_transactions()] == ["broker-a", "broker-b"]
+
+
 def test_retry_appends_audit_without_mutating_trade_state(tmp_path):
     b = broker(tmp_path)
     b.submit(intent(), price="100")
@@ -123,6 +142,15 @@ def test_decimal_precision_is_kept_in_paper_state(tmp_path):
     row = b.db.get_paper_holding(portfolio="p1", symbol="INFY")
     assert row["shares"] == "0.123456789123456789"
     assert row["avg_cost"] == "100.123456789123456789"
+
+
+def test_decimal_precision_is_kept_in_paper_transactions(tmp_path):
+    b = broker(tmp_path)
+    b.submit(intent(qty="0.123456789123456789"), price="100.123456789123456789")
+    row = b.db.list_paper_transactions(broker_id="paper")[0]
+    assert row["shares"] == "0.123456789123456789"
+    assert row["price"] == "100.123456789123456789"
+    assert row["fees"] == "0.000000000000000000"
 
 
 def test_max_idempotency_key_has_bounded_fill_id(tmp_path):

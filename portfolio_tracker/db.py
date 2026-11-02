@@ -52,17 +52,16 @@ CREATE TABLE IF NOT EXISTS fills (
 );
 CREATE INDEX IF NOT EXISTS idx_fills_order_id ON fills(order_id);
 CREATE TABLE IF NOT EXISTS cash_ledger (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL DEFAULT '', portfolio_id TEXT NOT NULL DEFAULT '',
+    id INTEGER PRIMARY KEY AUTOINCREMENT, broker_id TEXT NOT NULL DEFAULT '', account_id TEXT NOT NULL DEFAULT '', portfolio_id TEXT NOT NULL DEFAULT '',
     currency TEXT NOT NULL, amount TEXT NOT NULL CHECK (length(amount) > 0),
     balance_after TEXT CHECK (balance_after IS NULL OR length(balance_after) > 0),
     entry_type TEXT NOT NULL, reference_id TEXT, created_at TEXT NOT NULL,
     CHECK (account_id <> '' OR portfolio_id <> '')
 );
-CREATE INDEX IF NOT EXISTS idx_cash_ledger_scope_created ON cash_ledger(account_id, portfolio_id, created_at);
 CREATE TABLE IF NOT EXISTS cash_balances (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL DEFAULT '', portfolio_id TEXT NOT NULL DEFAULT '',
+    id INTEGER PRIMARY KEY AUTOINCREMENT, broker_id TEXT NOT NULL DEFAULT '', account_id TEXT NOT NULL DEFAULT '', portfolio_id TEXT NOT NULL DEFAULT '',
     currency TEXT NOT NULL, balance TEXT NOT NULL CHECK (length(balance) > 0), updated_at TEXT NOT NULL,
-    UNIQUE(account_id, portfolio_id, currency), CHECK (account_id <> '' OR portfolio_id <> '')
+    UNIQUE(broker_id, account_id, portfolio_id, currency), CHECK (account_id <> '' OR portfolio_id <> '')
 );
 CREATE TABLE IF NOT EXISTS audit_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT, event_type TEXT NOT NULL, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL,
@@ -73,9 +72,14 @@ CREATE INDEX IF NOT EXISTS idx_audit_events_entity ON audit_events(entity_type, 
 CREATE TRIGGER IF NOT EXISTS audit_events_no_update BEFORE UPDATE ON audit_events BEGIN SELECT RAISE(ABORT, 'audit_events is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS audit_events_no_delete BEFORE DELETE ON audit_events BEGIN SELECT RAISE(ABORT, 'audit_events is append-only'); END;
 CREATE TABLE IF NOT EXISTS paper_holdings (
-    portfolio TEXT NOT NULL, symbol TEXT NOT NULL, currency TEXT NOT NULL,
+    broker_id TEXT NOT NULL DEFAULT 'paper', portfolio TEXT NOT NULL, symbol TEXT NOT NULL, currency TEXT NOT NULL,
     shares TEXT NOT NULL CHECK (length(shares) > 0), avg_cost TEXT NOT NULL CHECK (length(avg_cost) > 0),
-    updated_at TEXT NOT NULL, PRIMARY KEY (portfolio, symbol)
+    updated_at TEXT NOT NULL, PRIMARY KEY (broker_id, portfolio, symbol)
+);
+CREATE TABLE IF NOT EXISTS paper_transactions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, broker_id TEXT NOT NULL, portfolio TEXT NOT NULL, symbol TEXT NOT NULL,
+    side TEXT NOT NULL, shares TEXT NOT NULL CHECK (length(shares) > 0), price TEXT NOT NULL CHECK (length(price) > 0),
+    currency TEXT NOT NULL, fees TEXT NOT NULL CHECK (length(fees) > 0), trade_date TEXT NOT NULL, notes TEXT DEFAULT ''
 );
 """
 
@@ -146,7 +150,7 @@ _MIGRATION_TABLES = {
     """,
     "cash_ledger": """
         CREATE TABLE cash_ledger (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL DEFAULT '', portfolio_id TEXT NOT NULL DEFAULT '',
+            id INTEGER PRIMARY KEY AUTOINCREMENT, broker_id TEXT NOT NULL DEFAULT '', account_id TEXT NOT NULL DEFAULT '', portfolio_id TEXT NOT NULL DEFAULT '',
             currency TEXT NOT NULL, amount TEXT NOT NULL CHECK (length(amount) > 0),
             balance_after TEXT CHECK (balance_after IS NULL OR length(balance_after) > 0),
             entry_type TEXT NOT NULL, reference_id TEXT, created_at TEXT NOT NULL,
@@ -155,9 +159,9 @@ _MIGRATION_TABLES = {
     """,
     "cash_balances": """
         CREATE TABLE cash_balances (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL DEFAULT '', portfolio_id TEXT NOT NULL DEFAULT '',
+            id INTEGER PRIMARY KEY AUTOINCREMENT, broker_id TEXT NOT NULL DEFAULT '', account_id TEXT NOT NULL DEFAULT '', portfolio_id TEXT NOT NULL DEFAULT '',
             currency TEXT NOT NULL, balance TEXT NOT NULL CHECK (length(balance) > 0), updated_at TEXT NOT NULL,
-            UNIQUE(account_id, portfolio_id, currency), CHECK (account_id <> '' OR portfolio_id <> '')
+            UNIQUE(broker_id, account_id, portfolio_id, currency), CHECK (account_id <> '' OR portfolio_id <> '')
         )
     """,
     "audit_events": """
@@ -181,11 +185,11 @@ _EXPECTED_COLUMNS = {
         "execution_payload": (1, "'{}'"), "filled_at": (1, None), "created_at": (1, None),
     },
     "cash_ledger": {
-        "id": (0, None), "account_id": (1, "''"), "portfolio_id": (1, "''"), "currency": (1, None),
+        "id": (0, None), "broker_id": (1, "''"), "account_id": (1, "''"), "portfolio_id": (1, "''"), "currency": (1, None),
         "amount": (1, None), "balance_after": (0, None), "entry_type": (1, None), "reference_id": (0, None), "created_at": (1, None),
     },
     "cash_balances": {
-        "id": (0, None), "account_id": (1, "''"), "portfolio_id": (1, "''"), "currency": (1, None),
+        "id": (0, None), "broker_id": (1, "''"), "account_id": (1, "''"), "portfolio_id": (1, "''"), "currency": (1, None),
         "balance": (1, None), "updated_at": (1, None),
     },
     "audit_events": {
@@ -198,7 +202,7 @@ _EXPECTED_COLUMNS = {
 _EXPECTED_INDEXES = {
     "order_intents": {"idx_order_intents_account_created": (False, ("account_id", "created_at")), "idx_order_intents_status": (False, ("status",))},
     "fills": {"idx_fills_order_id": (False, ("order_id",))},
-    "cash_ledger": {"idx_cash_ledger_scope_created": (False, ("account_id", "portfolio_id", "created_at"))},
+    "cash_ledger": {"idx_cash_ledger_scope_created": (False, ("broker_id", "account_id", "portfolio_id", "created_at"))},
     "cash_balances": {},
     "audit_events": {"idx_audit_events_entity": (False, ("entity_type", "entity_id", "id"))},
 }
@@ -272,7 +276,7 @@ def _needs_migration(conn: sqlite3.Connection, table: str) -> bool:
         unique_columns = {
             "order_intents": ("idempotency_key",),
             "fills": ("broker_id", "account_id", "order_id", "external_fill_id"),
-            "cash_balances": ("account_id", "portfolio_id", "currency"),
+            "cash_balances": ("broker_id", "account_id", "portfolio_id", "currency"),
         }[table]
         if not any(unique and columns == unique_columns for unique, columns in indexes.values()):
             return True
@@ -331,9 +335,9 @@ def _migrate_legacy_tables(conn: sqlite3.Connection) -> None:
             if not account_id and not portfolio_id:
                 account_id = "legacy"
             if table == "cash_ledger":
-                conn.execute("INSERT INTO cash_ledger(id, account_id, portfolio_id, currency, amount, balance_after, entry_type, reference_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (row["id"], account_id, portfolio_id, row.get("currency") or "INR", row.get("amount") or "0", row.get("balance_after"), row.get("entry_type") or "legacy", row.get("reference_id"), row.get("created_at") or datetime.now(timezone.utc).isoformat()))
+                conn.execute("INSERT INTO cash_ledger(id, broker_id, account_id, portfolio_id, currency, amount, balance_after, entry_type, reference_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (row["id"], row.get("broker_id") or "", account_id, portfolio_id, row.get("currency") or "INR", row.get("amount") or "0", row.get("balance_after"), row.get("entry_type") or "legacy", row.get("reference_id"), row.get("created_at") or datetime.now(timezone.utc).isoformat()))
             else:
-                conn.execute("INSERT INTO cash_balances(id, account_id, portfolio_id, currency, balance, updated_at) VALUES (?, ?, ?, ?, ?, ?)", (row["id"], account_id, portfolio_id, row.get("currency") or "INR", row.get("balance") or "0", row.get("updated_at") or datetime.now(timezone.utc).isoformat()))
+                conn.execute("INSERT INTO cash_balances(id, broker_id, account_id, portfolio_id, currency, balance, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (row["id"], row.get("broker_id") or "", account_id, portfolio_id, row.get("currency") or "INR", row.get("balance") or "0", row.get("updated_at") or datetime.now(timezone.utc).isoformat()))
     if "audit_events" in rebuild:
         for row in saved["audit_events"]:
             conn.execute("INSERT INTO audit_events(id, event_type, entity_type, entity_id, broker_id, account_id, portfolio_id, mode, payload, occurred_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (row["id"], row.get("event_type") or "legacy", row.get("entity_type") or "legacy", row.get("entity_id") or str(row["id"]), row.get("broker_id"), row.get("account_id"), row.get("portfolio_id"), row.get("mode") if row.get("mode") in {None, "paper", "live"} else None, row.get("payload") or "{}", row.get("occurred_at") or datetime.now(timezone.utc).isoformat(), row.get("created_at") or datetime.now(timezone.utc).isoformat()))
@@ -345,12 +349,26 @@ def _ensure_supporting_objects(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_order_intents_account_created ON order_intents(account_id, created_at);
         CREATE INDEX IF NOT EXISTS idx_order_intents_status ON order_intents(status);
         CREATE INDEX IF NOT EXISTS idx_fills_order_id ON fills(order_id);
-        CREATE INDEX IF NOT EXISTS idx_cash_ledger_scope_created ON cash_ledger(account_id, portfolio_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_cash_ledger_scope_created ON cash_ledger(broker_id, account_id, portfolio_id, created_at);
         CREATE INDEX IF NOT EXISTS idx_audit_events_entity ON audit_events(entity_type, entity_id, id);
         CREATE TRIGGER IF NOT EXISTS audit_events_no_update BEFORE UPDATE ON audit_events BEGIN SELECT RAISE(ABORT, 'audit_events is append-only'); END;
         CREATE TRIGGER IF NOT EXISTS audit_events_no_delete BEFORE DELETE ON audit_events BEGIN SELECT RAISE(ABORT, 'audit_events is append-only'); END;
         """
     )
+
+
+def _migrate_paper_holdings(conn: sqlite3.Connection) -> None:
+    columns = _table_columns(conn, "paper_holdings")
+    if not columns or "broker_id" in columns:
+        return
+    conn.execute("ALTER TABLE paper_holdings RENAME TO paper_holdings_legacy")
+    conn.execute("""CREATE TABLE paper_holdings (
+        broker_id TEXT NOT NULL DEFAULT 'paper', portfolio TEXT NOT NULL, symbol TEXT NOT NULL, currency TEXT NOT NULL,
+        shares TEXT NOT NULL CHECK (length(shares) > 0), avg_cost TEXT NOT NULL CHECK (length(avg_cost) > 0),
+        updated_at TEXT NOT NULL, PRIMARY KEY (broker_id, portfolio, symbol)
+    )""")
+    conn.execute("INSERT INTO paper_holdings(broker_id, portfolio, symbol, currency, shares, avg_cost, updated_at) SELECT 'paper', portfolio, symbol, currency, shares, avg_cost, updated_at FROM paper_holdings_legacy")
+    conn.execute("DROP TABLE paper_holdings_legacy")
 
 
 @dataclass
@@ -380,6 +398,7 @@ class Database:
             conn.execute("PRAGMA foreign_keys = OFF")
             conn.executescript(SCHEMA)
             _migrate_legacy_tables(conn)
+            _migrate_paper_holdings(conn)
             _ensure_supporting_objects(conn)
             conn.execute("PRAGMA foreign_keys = ON")
 
@@ -462,47 +481,50 @@ class Database:
         with self.connect() as conn:
             return conn.execute("SELECT * FROM fills" + (" WHERE order_id=?" if order_id else "") + " ORDER BY id", (order_id,) if order_id else ()).fetchall()
 
-    def insert_cash_ledger(self, *, amount: Decimal | int | str | float, currency: str, entry_type: str, account_id: str | None = None, portfolio_id: str | None = None, balance_after: Decimal | int | str | float | None = None, reference_id: str | None = None, created_at: str | None = None) -> int:
+    def insert_cash_ledger(self, *, amount: Decimal | int | str | float, currency: str, entry_type: str, account_id: str | None = None, portfolio_id: str | None = None, broker_id: str = "", balance_after: Decimal | int | str | float | None = None, reference_id: str | None = None, created_at: str | None = None) -> int:
         account_id, portfolio_id = _scope(account_id), _scope(portfolio_id)
         if not account_id and not portfolio_id:
             raise ValueError("account_id or portfolio_id is required")
         amount_text = _canonical_decimal(amount, "amount")
         balance_text = None if balance_after is None else _canonical_decimal(balance_after, "balance_after", nonnegative=True)
         with self.connect() as conn:
-            cur = conn.execute("INSERT INTO cash_ledger(account_id, portfolio_id, currency, amount, balance_after, entry_type, reference_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (account_id, portfolio_id, _currency(currency), amount_text, balance_text, entry_type, reference_id, created_at or datetime.now(timezone.utc).isoformat()))
+            cur = conn.execute("INSERT INTO cash_ledger(broker_id, account_id, portfolio_id, currency, amount, balance_after, entry_type, reference_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (broker_id, account_id, portfolio_id, _currency(currency), amount_text, balance_text, entry_type, reference_id, created_at or datetime.now(timezone.utc).isoformat()))
             return int(cur.lastrowid)
 
     def get_cash_ledger(self, entry_id: int) -> sqlite3.Row | None:
         with self.connect() as conn:
             return conn.execute("SELECT * FROM cash_ledger WHERE id=?", (entry_id,)).fetchone()
 
-    def list_cash_ledger(self, *, account_id: str | None = None, portfolio_id: str | None = None, currency: str | None = None) -> list[sqlite3.Row]:
+    def list_cash_ledger(self, *, account_id: str | None = None, portfolio_id: str | None = None, currency: str | None = None, broker_id: str | None = None) -> list[sqlite3.Row]:
         clauses, params = [], []
-        for name, value in (("account_id", account_id), ("portfolio_id", portfolio_id), ("currency", currency)):
+        for name, value in (("broker_id", broker_id), ("account_id", account_id), ("portfolio_id", portfolio_id), ("currency", currency)):
             if value is not None:
                 clauses.append(name + "=?"); params.append(_scope(value).upper() if name == "currency" else _scope(value))
         with self.connect() as conn:
             return conn.execute("SELECT * FROM cash_ledger" + (" WHERE " + " AND ".join(clauses) if clauses else "") + " ORDER BY id", params).fetchall()
 
-    def upsert_cash_balance(self, *, balance: Decimal | int | str | float, currency: str, account_id: str | None = None, portfolio_id: str | None = None, updated_at: str | None = None) -> int:
+    def upsert_cash_balance(self, *, balance: Decimal | int | str | float, currency: str, account_id: str | None = None, portfolio_id: str | None = None, broker_id: str = "", updated_at: str | None = None) -> int:
         account_id, portfolio_id = _scope(account_id), _scope(portfolio_id)
         if not account_id and not portfolio_id:
             raise ValueError("account_id or portfolio_id is required")
         balance_text = _canonical_decimal(balance, "balance", nonnegative=True)
         now = updated_at or datetime.now(timezone.utc).isoformat()
         with self.connect() as conn:
-            conn.execute("INSERT INTO cash_balances(account_id, portfolio_id, currency, balance, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(account_id, portfolio_id, currency) DO UPDATE SET balance=excluded.balance, updated_at=excluded.updated_at", (account_id, portfolio_id, currency.upper(), balance_text, now))
-            return int(conn.execute("SELECT id FROM cash_balances WHERE account_id=? AND portfolio_id=? AND currency=?", (account_id, portfolio_id, _currency(currency))).fetchone()[0])
+            conn.execute("INSERT INTO cash_balances(broker_id, account_id, portfolio_id, currency, balance, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(broker_id, account_id, portfolio_id, currency) DO UPDATE SET balance=excluded.balance, updated_at=excluded.updated_at", (broker_id, account_id, portfolio_id, _currency(currency), balance_text, now))
+            return int(conn.execute("SELECT id FROM cash_balances WHERE broker_id=? AND account_id=? AND portfolio_id=? AND currency=?", (broker_id, account_id, portfolio_id, _currency(currency))).fetchone()[0])
 
     insert_cash_balance = upsert_cash_balance
 
-    def get_cash_balance(self, *, currency: str, account_id: str | None = None, portfolio_id: str | None = None) -> sqlite3.Row | None:
+    def get_cash_balance(self, *, currency: str, account_id: str | None = None, portfolio_id: str | None = None, broker_id: str | None = None) -> sqlite3.Row | None:
         with self.connect() as conn:
-            return conn.execute("SELECT * FROM cash_balances WHERE account_id=? AND portfolio_id=? AND currency=?", (_scope(account_id), _scope(portfolio_id), _currency(currency))).fetchone()
+            if broker_id is not None:
+                return conn.execute("SELECT * FROM cash_balances WHERE broker_id=? AND account_id=? AND portfolio_id=? AND currency=?", (broker_id, _scope(account_id), _scope(portfolio_id), _currency(currency))).fetchone()
+            row = conn.execute("SELECT * FROM cash_balances WHERE broker_id='paper' AND account_id=? AND portfolio_id=? AND currency=?", (_scope(account_id), _scope(portfolio_id), _currency(currency))).fetchone()
+            return row or conn.execute("SELECT * FROM cash_balances WHERE broker_id='' AND account_id=? AND portfolio_id=? AND currency=?", (_scope(account_id), _scope(portfolio_id), _currency(currency))).fetchone()
 
-    def list_cash_balances(self, *, account_id: str | None = None, portfolio_id: str | None = None, currency: str | None = None) -> list[sqlite3.Row]:
+    def list_cash_balances(self, *, account_id: str | None = None, portfolio_id: str | None = None, currency: str | None = None, broker_id: str | None = None) -> list[sqlite3.Row]:
         clauses, params = [], []
-        for name, value in (("account_id", account_id), ("portfolio_id", portfolio_id), ("currency", currency)):
+        for name, value in (("broker_id", broker_id), ("account_id", account_id), ("portfolio_id", portfolio_id), ("currency", currency)):
             if value is not None:
                 clauses.append(name + "=?"); params.append(_currency(value) if name == "currency" else _scope(value))
         with self.connect() as conn:
@@ -550,9 +572,13 @@ class Database:
             conn.execute("INSERT INTO transactions(portfolio, symbol, side, shares, price, currency, fees, trade_date, notes) VALUES(?,?,?,?,?,?,?,?,?)", (portfolio, symbol, side, float(delta), float(price), currency, float(fee), trade_date or datetime.now(timezone.utc).date().isoformat(), notes))
             conn.commit()
 
-    def get_paper_holding(self, *, portfolio: str, symbol: str) -> sqlite3.Row | None:
+    def get_paper_holding(self, *, broker_id: str = "paper", portfolio: str, symbol: str) -> sqlite3.Row | None:
         with self.connect() as conn:
-            return conn.execute("SELECT * FROM paper_holdings WHERE portfolio=? AND symbol=?", (portfolio, symbol)).fetchone()
+            return conn.execute("SELECT * FROM paper_holdings WHERE broker_id=? AND portfolio=? AND symbol=?", (broker_id, portfolio, symbol)).fetchone()
+
+    def list_paper_transactions(self, *, broker_id: str | None = None) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute("SELECT * FROM paper_transactions" + (" WHERE broker_id=?" if broker_id is not None else "") + " ORDER BY id", (broker_id,) if broker_id is not None else ()).fetchall()
 
     def execute_paper_submission(self, *, intent: OrderIntent, broker_id: str, quantity: Decimal, fill_price: Decimal, fee: Decimal, total: Decimal, now: str, fill_id: str, reason: str | None = None, audit_callback=None) -> dict[str, Any]:
         account_id = intent.account_id or ""
@@ -568,10 +594,10 @@ class Database:
                 if audit_callback:
                     audit_callback(conn, "order.retry", "order_intent", str(row["id"]), intent, {"reused": True}, now)
                 self._append_audit_event_conn(conn, "order.retry", "order_intent", str(row["id"]), {"intent": intent.to_dict(), "reused": True}, broker_id, intent.account_id, intent.portfolio_id, intent.mode.value, now)
-                return {"order_id": row["id"], "status": row["status"], "reused": True, "cash": self._cash_in_conn(conn, intent.currency, account_id, portfolio_id), "fill": conn.execute("SELECT * FROM fills WHERE order_id=? ORDER BY id LIMIT 1", (row["id"],)).fetchone()}
+                return {"order_id": row["id"], "status": row["status"], "reused": True, "cash": self._cash_in_conn(conn, intent.currency, account_id, portfolio_id, broker_id), "fill": conn.execute("SELECT * FROM fills WHERE order_id=? ORDER BY id LIMIT 1", (row["id"],)).fetchone()}
             cur = conn.execute("INSERT INTO order_intents(broker_id, account_id, portfolio_id, mode, idempotency_key, order_payload, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (broker_id, intent.account_id, intent.portfolio_id, intent.mode.value, storage_key, payload, "rejected" if reason else "accepted", now, now))
             order_id = int(cur.lastrowid)
-            cash = self._cash_in_conn(conn, intent.currency, account_id, portfolio_id)
+            cash = self._cash_in_conn(conn, intent.currency, account_id, portfolio_id, broker_id)
             if reason:
                 if audit_callback:
                     audit_callback(conn, "order.rejected", "order_intent", str(order_id), intent, {"reason": reason}, now)
@@ -580,19 +606,19 @@ class Database:
             is_buy = str(intent.side) == "buy"
             new_cash = cash - total if is_buy else cash + total
             balance_text = _canonical_decimal(new_cash, "balance", nonnegative=True)
-            conn.execute("INSERT INTO cash_balances(account_id, portfolio_id, currency, balance, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(account_id, portfolio_id, currency) DO UPDATE SET balance=excluded.balance, updated_at=excluded.updated_at", (account_id, portfolio_id, _currency(intent.currency), balance_text, now))
+            conn.execute("INSERT INTO cash_balances(broker_id, account_id, portfolio_id, currency, balance, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(broker_id, account_id, portfolio_id, currency) DO UPDATE SET balance=excluded.balance, updated_at=excluded.updated_at", (broker_id, account_id, portfolio_id, _currency(intent.currency), balance_text, now))
             amount = -total if is_buy else total
-            conn.execute("INSERT INTO cash_ledger(account_id, portfolio_id, currency, amount, balance_after, entry_type, reference_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (account_id, portfolio_id, _currency(intent.currency), _canonical_decimal(amount, "amount"), balance_text, "trade", str(order_id), now))
-            holding = conn.execute("SELECT shares, avg_cost FROM paper_holdings WHERE portfolio=? AND symbol=?", (portfolio_id, intent.symbol)).fetchone()
+            conn.execute("INSERT INTO cash_ledger(broker_id, account_id, portfolio_id, currency, amount, balance_after, entry_type, reference_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (broker_id, account_id, portfolio_id, _currency(intent.currency), _canonical_decimal(amount, "amount"), balance_text, "trade", str(order_id), now))
+            holding = conn.execute("SELECT shares, avg_cost FROM paper_holdings WHERE broker_id=? AND portfolio=? AND symbol=?", (broker_id, portfolio_id, intent.symbol)).fetchone()
             owned = Decimal(holding["shares"]) if holding else Decimal("0")
             old_avg = Decimal(holding["avg_cost"]) if holding else Decimal("0")
             new_shares = owned + quantity if is_buy else owned - quantity
             new_avg = ((owned * old_avg) + (quantity * fill_price) + fee) / new_shares if is_buy else (old_avg if new_shares else Decimal("0"))
             new_avg = new_avg.quantize(Decimal("0.000000000000000001"))
             shares_text, avg_text = _canonical_decimal(new_shares, "shares", nonnegative=True), _canonical_decimal(new_avg, "avg_cost", nonnegative=True)
-            conn.execute("INSERT INTO paper_holdings(portfolio, symbol, currency, shares, avg_cost, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(portfolio, symbol) DO UPDATE SET currency=excluded.currency, shares=excluded.shares, avg_cost=excluded.avg_cost, updated_at=excluded.updated_at", (portfolio_id, intent.symbol, _currency(intent.currency), shares_text, avg_text, now))
-            conn.execute("INSERT INTO holdings(portfolio, symbol, label, currency, shares, avg_cost, notes, updated_at) VALUES (?, ?, '', ?, ?, ?, '', ?) ON CONFLICT(portfolio, symbol) DO UPDATE SET shares=excluded.shares, avg_cost=excluded.avg_cost, currency=excluded.currency, updated_at=excluded.updated_at", (portfolio_id, intent.symbol, _currency(intent.currency), float(new_shares), float(new_avg), now))
-            conn.execute("INSERT INTO transactions(portfolio, symbol, side, shares, price, currency, fees, trade_date, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (portfolio_id, intent.symbol, str(intent.side), float(quantity), float(fill_price), _currency(intent.currency), float(fee), now[:10], "paper broker"))
+            conn.execute("INSERT INTO paper_holdings(broker_id, portfolio, symbol, currency, shares, avg_cost, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(broker_id, portfolio, symbol) DO UPDATE SET currency=excluded.currency, shares=excluded.shares, avg_cost=excluded.avg_cost, updated_at=excluded.updated_at", (broker_id, portfolio_id, intent.symbol, _currency(intent.currency), shares_text, avg_text, now))
+            conn.execute("INSERT INTO holdings(portfolio, symbol, label, currency, shares, avg_cost, notes, updated_at) VALUES (?, ?, '', ?, ?, ?, '', ?) ON CONFLICT(portfolio, symbol) DO UPDATE SET shares=excluded.shares, avg_cost=excluded.avg_cost, currency=excluded.currency, updated_at=excluded.updated_at", (portfolio_id, intent.symbol, _currency(intent.currency), str(new_shares), str(new_avg), now))
+            conn.execute("INSERT INTO paper_transactions(broker_id, portfolio, symbol, side, shares, price, currency, fees, trade_date, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (broker_id, portfolio_id, intent.symbol, str(intent.side), _canonical_decimal(quantity, "shares", positive=True), _canonical_decimal(fill_price, "price", positive=True), _currency(intent.currency), _canonical_decimal(fee, "fees", nonnegative=True), now[:10], "paper broker"))
             execution = {"fee": _canonical_decimal(fee, "fee", nonnegative=True), "total": _canonical_decimal(total, "total", nonnegative=True)}
             conn.execute("INSERT INTO fills(order_id, broker_id, account_id, external_fill_id, quantity, price, currency, execution_payload, filled_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (order_id, broker_id, account_id, fill_id, _canonical_decimal(quantity, "fill quantity", positive=True), _canonical_decimal(fill_price, "fill price", positive=True), _currency(intent.currency), _canonical_json(execution, "execution payload"), now, now))
             conn.execute("UPDATE order_intents SET status='filled', updated_at=? WHERE id=?", (now, order_id))
@@ -602,8 +628,8 @@ class Database:
             return {"order_id": order_id, "status": "filled", "reused": False, "cash": new_cash, "fill": conn.execute("SELECT * FROM fills WHERE id=last_insert_rowid()").fetchone()}
 
     @staticmethod
-    def _cash_in_conn(conn: sqlite3.Connection, currency: str, account_id: str, portfolio_id: str) -> Decimal:
-        row = conn.execute("SELECT balance FROM cash_balances WHERE account_id=? AND portfolio_id=? AND currency=?", (account_id, portfolio_id, _currency(currency))).fetchone()
+    def _cash_in_conn(conn: sqlite3.Connection, currency: str, account_id: str, portfolio_id: str, broker_id: str) -> Decimal:
+        row = conn.execute("SELECT balance FROM cash_balances WHERE broker_id=? AND account_id=? AND portfolio_id=? AND currency=?", (broker_id, account_id, portfolio_id, _currency(currency))).fetchone()
         return Decimal(row["balance"]) if row else Decimal("0")
 
     @staticmethod
