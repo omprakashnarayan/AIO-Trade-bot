@@ -142,18 +142,16 @@ Set these exact Unraid container environment variables and restart the container
 PORTFOLIO_ADMIN_USERNAME=admin
 PORTFOLIO_ADMIN_PASSWORD_HASH=<output from the command above>
 PORTFOLIO_SESSION_SECRET=<random 32+ byte secret>
-PORTFOLIO_ALLOWED_CIDRS=192.168.1.0/24,127.0.0.1/32
-PORTFOLIO_SCHEDULER_ENABLED=false
-# Optional risk gates:
-PORTFOLIO_MAX_ORDER_NOTIONAL=100000
-PORTFOLIO_MAX_POSITION_WEIGHT=0.25
+PORTFOLIO_ALLOWED_CIDRS=192.168.200.0/24,127.0.0.1/32
 # Optional connector declarations only; this console makes no provider calls:
 KITE_MCP_ENDPOINT=
 UPSTOX_MCP_ENDPOINT=
 INDMONEY_MCP_ENDPOINT=
 ```
 
-`PORTFOLIO_ALLOWED_CIDRS` is mandatory for LAN access. If omitted, only loopback (`127.0.0.1` and `::1`) is allowed; the application does not guess the Unraid subnet. Replace `192.168.1.0/24` with the actual LAN CIDR, and do not include a public or Docker-wide range.
+All trading configuration—trading mode, risk limits, scheduler enabled state, default account/portfolio/currency, and strategy preferences—is changed from the authenticated Settings UI and persisted under `/data/settings.json`. It is not read from Docker environment variables. Docker environment variables are limited to deployment, authentication, network restriction, and connector declarations.
+
+`PORTFOLIO_ALLOWED_CIDRS` is mandatory for LAN access. If omitted, only loopback (`127.0.0.1` and `::1`) is allowed; the application does not guess the Unraid subnet. Replace `192.168.200.0/24` with the actual LAN CIDR, and do not include a public or Docker-wide range.
 
 Open `http://<unraid-host>:5055/`, sign in, and use the navigation for Portfolio, Trades, Integrations, Strategies, Scheduler, Audit/Risk, and Settings. Paper orders are submitted only through `ExecutionGateway` and are subject to risk checks, cash/position checks, idempotency, and the persistent global kill switch. Strategy endpoints generate proposals from supplied facts and do not call providers. Sync controls report an unconfigured connector honestly rather than pretending a sync occurred.
 

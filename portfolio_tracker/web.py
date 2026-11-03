@@ -12,7 +12,7 @@ from typing import Any
 from flask import Flask, jsonify, redirect, render_template_string, request, session, url_for
 from werkzeug.security import check_password_hash
 
-from .config import load_settings, save_settings
+from .config import DEFAULT_SETTINGS, load_settings, save_settings
 from .db import Database
 from .execution import ExecutionGateway, LiveModeRejected
 from .reporting import generate_report
@@ -179,7 +179,7 @@ action_template = """
 </body></html>
 """
 
-_SETTINGS_KEYS = ("owner_name", "risk_profile", "monthly_contribution", "reminder_time", "notes")
+_SETTINGS_KEYS = ("owner_name", "risk_profile", "monthly_contribution", "reminder_time", "notes", "trading_mode", "max_order_notional", "max_position_weight", "scheduler_enabled", "default_account_id", "default_portfolio_id", "default_currency")
 
 
 def _money(value, currency="INR"):
@@ -233,11 +233,26 @@ def index():
 
 @app.post("/settings")
 def update_settings():
-    settings = load_settings()
+    settings = {**DEFAULT_SETTINGS, **load_settings()}
     for key in _SETTINGS_KEYS:
-        settings[key] = request.form.get(key, settings.get(key, ""))
+        if key in request.form:
+            settings[key] = request.form.get(key, settings.get(key, ""))
+    if settings.get("risk_profile") not in {"low", "balanced", "aggressive"}:
+        return jsonify({"error": "risk_profile must be low, balanced, or aggressive"}), 400
+    if settings.get("trading_mode") not in {"paper", "approval_required"}:
+        return jsonify({"error": "trading_mode must be paper or approval_required"}), 400
+    try:
+        max_order_text = str(settings.get("max_order_notional", "")).strip()
+        max_weight_text = str(settings.get("max_position_weight", "")).strip()
+        if max_order_text and Decimal(max_order_text) <= 0:
+            raise ValueError
+        if max_weight_text and not (Decimal("0") < Decimal(max_weight_text) <= Decimal("1")):
+            raise ValueError
+    except (ValueError, TypeError, ArithmeticError):
+        return jsonify({"error": "max order notional must be positive and max position weight must be between 0 and 1"}), 400
+    settings["scheduler_enabled"] = str(settings.get("scheduler_enabled", "false")).lower() in {"true", "on", "1", "yes"}
     save_settings(settings)
-    return redirect(url_for("index"))
+    return redirect(url_for("operator_page", section="settings"))
 
 
 @app.post("/holdings")
@@ -262,12 +277,24 @@ def api_get_settings():
 @app.route("/api/settings", methods=["PUT", "PATCH"])
 def api_update_settings():
     payload = _payload()
-    settings = load_settings()
+    settings = {**DEFAULT_SETTINGS, **load_settings()}
     for key in _SETTINGS_KEYS:
         if key in payload:
-            settings[key] = str(payload[key])
+            settings[key] = payload[key]
     if settings.get("risk_profile") not in {"low", "balanced", "aggressive"}:
         return jsonify({"error": "risk_profile must be low, balanced, or aggressive"}), 400
+    if settings.get("trading_mode") not in {"paper", "approval_required"}:
+        return jsonify({"error": "trading_mode must be paper or approval_required"}), 400
+    try:
+        max_order_text = str(settings.get("max_order_notional", "")).strip()
+        max_weight_text = str(settings.get("max_position_weight", "")).strip()
+        if max_order_text and Decimal(max_order_text) <= 0:
+            raise ValueError
+        if max_weight_text and not (Decimal("0") < Decimal(max_weight_text) <= Decimal("1")):
+            raise ValueError
+    except (ValueError, TypeError, ArithmeticError):
+        return jsonify({"error": "max order notional must be positive and max position weight must be between 0 and 1"}), 400
+    settings["scheduler_enabled"] = bool(settings.get("scheduler_enabled")) if isinstance(settings.get("scheduler_enabled"), bool) else str(settings.get("scheduler_enabled", "false")).lower() in {"true", "on", "1", "yes"}
     save_settings(settings)
     return jsonify(settings)
 
@@ -365,7 +392,7 @@ OPERATOR_PAGE_TEMPLATE = """
 {% elif section == 'audit' %}
 <div class="card"><h2>Risk controls</h2><p>Kill switch: <strong>{{ data.kill_switch }}</strong></p><div class="actions"><button class="danger" onclick="postJson('/api/risk/kill-switch',{state:'on'})">Turn kill switch ON</button><button onclick="postJson('/api/risk/kill-switch',{state:'off'})">Turn kill switch OFF</button></div><div id="result" class="status">Risk actions are audited.</div></div><div class="card"><h2>Recent audit events</h2><div class="table-wrap"><table><tr><th>Time</th><th>Event</th><th>Entity</th><th>Mode</th></tr>{% for e in data.events %}<tr><td>{{ e.created_at }}</td><td>{{ e.event_type }}</td><td>{{ e.entity_type }} {{ e.entity_id }}</td><td>{{ e.mode }}</td></tr>{% else %}<tr><td colspan="4" class="muted">No audit events.</td></tr>{% endfor %}</table></div></div>
 {% elif section == 'settings' %}
-<div class="card"><h2>Operator settings</h2><form method="post" action="/settings" class="form-grid"><label>Owner name<input name="owner_name" value="{{ data.owner_name }}"></label><label>Risk profile<select name="risk_profile">{% for option in ['low','balanced','aggressive'] %}<option value="{{ option }}" {% if data.risk_profile == option %}selected{% endif %}>{{ option }}</option>{% endfor %}</select></label><label>Monthly contribution<input name="monthly_contribution" value="{{ data.monthly_contribution }}"></label><label>Reminder time<input name="reminder_time" value="{{ data.reminder_time }}"></label><label style="grid-column:1/-1">Notes<textarea name="notes">{{ data.notes }}</textarea></label><button>Save settings</button></form></div>
+<div class="card"><h2>Operator and trading settings</h2><form method="post" action="/settings" class="form-grid"><label>Owner name<input name="owner_name" value="{{ data.owner_name }}"></label><label>Risk profile<select name="risk_profile">{% for option in ['low','balanced','aggressive'] %}<option value="{{ option }}" {% if data.risk_profile == option %}selected{% endif %}>{{ option }}</option>{% endfor %}</select></label><label>Trading mode<select name="trading_mode"><option value="paper" {% if data.trading_mode == 'paper' %}selected{% endif %}>Paper only</option><option value="approval_required" {% if data.trading_mode == 'approval_required' %}selected{% endif %}>Live screens + approval records</option></select></label><label>Max order notional<input name="max_order_notional" value="{{ data.max_order_notional }}"></label><label>Max position weight<input name="max_position_weight" value="{{ data.max_position_weight }}"></label><label>Scheduler enabled<select name="scheduler_enabled"><option value="false" {% if not data.scheduler_enabled %}selected{% endif %}>No</option><option value="true" {% if data.scheduler_enabled %}selected{% endif %}>Yes</option></select></label><label>Default account ID<input name="default_account_id" value="{{ data.default_account_id }}"></label><label>Default portfolio ID<input name="default_portfolio_id" value="{{ data.default_portfolio_id }}"></label><label>Default currency<input name="default_currency" value="{{ data.default_currency }}"></label><label>Monthly contribution<input name="monthly_contribution" value="{{ data.monthly_contribution }}"></label><label>Reminder time<input name="reminder_time" value="{{ data.reminder_time }}"></label><label style="grid-column:1/-1">Notes<textarea name="notes">{{ data.notes }}</textarea></label><button>Save settings</button></form><p class="muted">Trading configuration is stored in the application data volume and is not read from Docker environment variables.</p><div id="result" class="status">Changes are saved through the UI.</div></div>
 {% endif %}
 </div><script>
 async function postJson(url,payload){const box=document.getElementById('result');try{const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const d=await r.json();box.textContent=JSON.stringify(d,null,2);box.className='status'+(r.ok?'':' error')}catch(e){box.textContent=e;box.className='status error'}}
@@ -399,7 +426,7 @@ def _scheduler_snapshot(db: Database):
     with db.connect() as conn:
         state = _json_rows(conn.execute("SELECT * FROM scheduler_state ORDER BY trigger_id").fetchall())
         runs = _json_rows(conn.execute("SELECT * FROM scheduler_runs ORDER BY created_at DESC LIMIT 100").fetchall())
-    return {"enabled": db.get_console_state("scheduler_enabled", os.environ.get("PORTFOLIO_SCHEDULER_ENABLED", "false")).lower() == "true", "state": state, "runs": runs}
+    return {"enabled": bool(load_settings().get("scheduler_enabled", False)), "state": state, "runs": runs}
 
 
 @app.get("/api/portfolio")
@@ -445,7 +472,8 @@ def api_paper_order():
     try:
         intent = OrderIntent(idempotency_key=str(payload["idempotency_key"]), portfolio_id=payload.get("portfolio_id", "Main"), account_id=payload.get("account_id"), symbol=str(payload["symbol"]), side=OrderSide(str(payload["side"]).lower()), order_type=OrderType.MARKET, time_in_force=TimeInForce.DAY, quantity=payload["quantity"], currency=str(payload.get("currency", "INR")), mode=ExecutionMode.PAPER, broker_id="paper")
         db = Database(); db.init_db()
-        limits = RiskLimits(global_kill_switch=db.get_console_state("global_kill_switch", "off") == "on", max_order_notional=_decimal_or_none(os.environ.get("PORTFOLIO_MAX_ORDER_NOTIONAL")), max_position_weight=_decimal_or_none(os.environ.get("PORTFOLIO_MAX_POSITION_WEIGHT")))
+        trading = load_settings()
+        limits = RiskLimits(global_kill_switch=db.get_console_state("global_kill_switch", "off") == "on", max_order_notional=_decimal_or_none(trading.get("max_order_notional")), max_position_weight=_decimal_or_none(trading.get("max_position_weight")))
         gateway = ExecutionGateway(db, risk=RiskEngine(limits=limits, db=db))
         decision = gateway.submit(intent, quote_price=payload["quote_price"], portfolio_value=payload.get("portfolio_value"), current_position_notional=payload.get("current_position_notional", "0"))
         result = {"status": decision.status, "risk": {"allowed": decision.risk.allowed, "code": decision.risk.code, "message": decision.risk.message, "details": decision.risk.details}, "error": decision.error}
@@ -504,6 +532,7 @@ def api_scheduler_state():
     payload = _payload(); value = str(payload.get("enabled", "")).lower()
     if value not in {"true", "false", "on", "off"}: return jsonify({"error": "enabled must be boolean"}), 400
     enabled = value in {"true", "on"}
+    settings = load_settings(); settings["scheduler_enabled"] = enabled; save_settings(settings)
     db = Database(); db.init_db(); db.set_console_state("scheduler_enabled", "true" if enabled else "false")
     db.append_audit_event(event_type="scheduler.state.changed", entity_type="scheduler", entity_id="operator", payload={"enabled": enabled}, mode="paper")
     return jsonify({"enabled": enabled})
@@ -524,7 +553,8 @@ def api_audit():
 @app.get("/api/risk")
 def api_risk():
     db = Database(); db.init_db()
-    return jsonify({"paper_only": True, "live_writes": False, "global_kill_switch": db.get_console_state("global_kill_switch", "off") == "on", "max_order_notional": os.environ.get("PORTFOLIO_MAX_ORDER_NOTIONAL"), "max_position_weight": os.environ.get("PORTFOLIO_MAX_POSITION_WEIGHT")})
+    settings = load_settings()
+    return jsonify({"paper_only": True, "live_writes": False, "trading_mode": settings.get("trading_mode"), "global_kill_switch": db.get_console_state("global_kill_switch", "off") == "on", "max_order_notional": settings.get("max_order_notional"), "max_position_weight": settings.get("max_position_weight"), "scheduler_enabled": settings.get("scheduler_enabled")})
 
 
 @app.post("/api/risk/kill-switch")

@@ -16,6 +16,14 @@ DEFAULT_SETTINGS = {
     "monthly_contribution": "",
     "reminder_time": "08:00",
     "notes": "",
+    # Trading controls are operator-editable in the UI and persisted in settings.json.
+    "trading_mode": "paper",
+    "max_order_notional": "",
+    "max_position_weight": "",
+    "scheduler_enabled": False,
+    "default_account_id": "operator",
+    "default_portfolio_id": "Main",
+    "default_currency": "INR",
 }
 
 
