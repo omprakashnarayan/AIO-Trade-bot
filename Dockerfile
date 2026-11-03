@@ -22,6 +22,6 @@ VOLUME ["/data"]
 EXPOSE 5055
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5055/api/report', timeout=3)" || exit 1
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5055/health', timeout=3)" || exit 1
 
 CMD ["python", "-c", "from portfolio_tracker.web import main; main(host='0.0.0.0', port=5055)"]
