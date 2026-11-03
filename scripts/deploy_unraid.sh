@@ -6,6 +6,11 @@ CONTAINER="${CONTAINER:-portfolio-tracker}"
 APPDATA_DIR="${APPDATA_DIR:-/mnt/user/appdata/portfolio-tracker}"
 PORT="${PORT:-5055}"
 HOST_IP="${HOST_IP:-192.168.200.196}"
+ADMIN_USERNAME="${PORTFOLIO_ADMIN_USERNAME:-}"
+ADMIN_PASSWORD_HASH="${PORTFOLIO_ADMIN_PASSWORD_HASH:-}"
+SESSION_SECRET="${PORTFOLIO_SESSION_SECRET:-}"
+ALLOWED_CIDRS="${PORTFOLIO_ALLOWED_CIDRS:-192.168.200.0/24,127.0.0.1/32}"
+SCHEDULER_ENABLED="${PORTFOLIO_SCHEDULER_ENABLED:-false}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 cd "$ROOT_DIR"
@@ -17,11 +22,19 @@ docker build -t "$IMAGE" .
 echo "Replacing Unraid container $CONTAINER..."
 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 
+env_args=()
+[ -n "$ADMIN_USERNAME" ] && env_args+=(--env "PORTFOLIO_ADMIN_USERNAME=$ADMIN_USERNAME")
+[ -n "$ADMIN_PASSWORD_HASH" ] && env_args+=(--env "PORTFOLIO_ADMIN_PASSWORD_HASH=$ADMIN_PASSWORD_HASH")
+[ -n "$SESSION_SECRET" ] && env_args+=(--env "PORTFOLIO_SESSION_SECRET=$SESSION_SECRET")
+
 docker run -d \
   --name "$CONTAINER" \
   --restart unless-stopped \
   -p "${HOST_IP}:${PORT}:5055" \
   --env PORTFOLIO_TRACKER_HOME=/data \
+  --env PORTFOLIO_ALLOWED_CIDRS="$ALLOWED_CIDRS" \
+  --env PORTFOLIO_SCHEDULER_ENABLED="$SCHEDULER_ENABLED" \
+  "${env_args[@]}" \
   --mount "type=bind,src=${APPDATA_DIR},dst=/data" \
   --security-opt no-new-privileges:true \
   --cap-drop ALL \
