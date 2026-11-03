@@ -16,6 +16,35 @@ No smoke test or paper execution path uses a network, live adapter, broker crede
 
 No US execution broker/API has been selected or configured; INDmoney is read-only for this project.
 
+## Docker deployment
+
+This host does not provide the Docker Compose plugin, so deploy with the included Docker CLI script. It builds the image, creates the persistent data volume, replaces the container, enables restart-on-boot, and waits for the health check:
+
+```bash
+./scripts/deploy_docker.sh
+```
+
+Defaults:
+
+- Image: `portfolio-tracker:local`
+- Container: `portfolio-tracker`
+- Persistent volume: `portfolio_tracker_data`
+- Web port: `5055`
+
+Override values when needed:
+
+```bash
+IMAGE=registry.example/portfolio-tracker:latest PORT=5055 ./scripts/deploy_docker.sh
+```
+
+The container stores its SQLite database and reports in `/data` and runs as a non-root user with a read-only root filesystem. Verify deployment with:
+
+```bash
+docker ps --filter name=portfolio-tracker
+docker inspect --format '{{.State.Health.Status}}' portfolio-tracker
+curl -fsS http://127.0.0.1:5055/api/report
+```
+
 ## Setup and tests
 
 From the repository root:
