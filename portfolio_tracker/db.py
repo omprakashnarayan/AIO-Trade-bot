@@ -590,6 +590,21 @@ class Database:
         with self.connect() as conn:
             conn.execute("INSERT INTO holdings(portfolio, symbol, label, currency, shares, avg_cost, notes, updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(portfolio, symbol) DO UPDATE SET label=excluded.label, currency=excluded.currency, shares=excluded.shares, avg_cost=excluded.avg_cost, notes=excluded.notes, updated_at=excluded.updated_at", (portfolio, symbol.upper(), label, currency.upper(), shares, avg_cost, notes, now))
 
+    def get_holding(self, *, portfolio: str, symbol: str) -> sqlite3.Row | None:
+        with self.connect() as conn:
+            return conn.execute("SELECT * FROM holdings WHERE portfolio=? AND symbol=?", (portfolio, symbol.upper())).fetchone()
+
+    def delete_holding(self, *, portfolio: str, symbol: str) -> bool:
+        """Delete a manual holding only when its position is fully closed."""
+        with self.connect() as conn:
+            row = conn.execute("SELECT shares FROM holdings WHERE portfolio=? AND symbol=?", (portfolio, symbol.upper())).fetchone()
+            if row is None:
+                return False
+            if abs(float(row["shares"])) > 1e-9:
+                raise ValueError("holding can only be deleted when shares are zero")
+            conn.execute("DELETE FROM holdings WHERE portfolio=? AND symbol=?", (portfolio, symbol.upper()))
+            return True
+
     @staticmethod
     def upsert_indmoney_holding_conn(conn: sqlite3.Connection, *, portfolio: str, symbol: str, label: str, account: str, shares: Decimal, avg_cost: Decimal, source: str, source_imported_at: str, ingested_at: str) -> None:
         shares_text = _canonical_decimal(shares, "shares", nonnegative=True)
