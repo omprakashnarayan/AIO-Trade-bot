@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "portfolio-tracker"
+version = "0.1.0"
+description = "Local portfolio tracker with daily suggestions"
+requires-python = ">=3.13"
+dependencies = [
+  "flask>=3.0.0",
+  "yfinance>=0.2.54",
+]
+
+[project.scripts]
+portfolio-tracker = "portfolio_tracker.cli:main"
+
+[tool.uv]
+package = true
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

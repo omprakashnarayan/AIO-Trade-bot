@@ -1,0 +1,23 @@
+services:
+  portfolio-tracker:
+    build:
+      context: .
+    image: portfolio-tracker:local
+    container_name: portfolio-tracker
+    restart: unless-stopped
+    ports:
+      - "5055:5055"
+    environment:
+      PORTFOLIO_TRACKER_HOME: /data
+    volumes:
+      - portfolio_tracker_data:/data
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,noexec,nosuid,nodev
+
+volumes:
+  portfolio_tracker_data:
