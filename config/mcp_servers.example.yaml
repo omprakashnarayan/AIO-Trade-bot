@@ -1,0 +1,37 @@
+# Example native MCP configuration for Hermes Agent.
+# Copy the mcp_servers block into ~/.hermes/config.yaml after reviewing
+# each provider's current authorization and tool list. Never commit tokens.
+#
+# The portfolio-tracker UI can manage local holdings/settings through its
+# CRUD API. Remote broker mutations must still pass the execution gateway.
+
+mcp_servers:
+  kite:
+    url: "https://mcp.kite.trade/mcp"
+    timeout: 180
+    connect_timeout: 60
+    sampling:
+      enabled: false
+    policy:
+      read: [profile, funds, holdings, positions, orders, market_data]
+      write: [paper_gateway_only]
+
+  upstox:
+    url: "https://mcp.upstox.com/mcp"
+    timeout: 180
+    connect_timeout: 60
+    sampling:
+      enabled: false
+    policy:
+      read: [profile, funds, holdings, positions, orders, market_data]
+      write: [paper_gateway_only]
+
+  indmoney:
+    url: "https://mcp.indmoney.com/mcp"
+    timeout: 180
+    connect_timeout: 60
+    sampling:
+      enabled: false
+    policy:
+      read: [us_holdings, portfolio]
+      write: [disabled]

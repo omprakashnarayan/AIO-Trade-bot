@@ -57,9 +57,21 @@ docker inspect --format '{{.State.Health.Status}}' portfolio-tracker
 curl -fsS http://127.0.0.1:5055/api/report
 ```
 
-## Setup and tests
+## MCP integration boundary
 
-From the repository root:
+The dashboard exposes local CRUD for manual holdings and settings. Remote app data should be accessed through native MCP connections, but MCP is treated as a transport—not as a risk engine.
+
+A reviewed example configuration is provided at `config/mcp_servers.example.yaml` for Kite, Upstox, and INDmoney. Copy only its `mcp_servers` block into the Hermes Agent config after reviewing the provider authorization flow and discovered tools. Do not commit tokens or credentials.
+
+Current safety policy:
+
+- Kite and Upstox data can be read through approved MCP tools; any order proposal must be converted into a typed paper intent and pass the execution gateway.
+- INDmoney remains read-only holdings visibility/import; no buy, sell, transfer, or account mutation is exposed.
+- The dashboard's local CRUD endpoints mutate only the local SQLite-backed manual portfolio, not remote broker accounts.
+- Provider connectivity is not claimed until the MCP server is authorized and a real read call is verified.
+
+The dashboard shows this distinction explicitly in its Integrations panel.
+
 
 ```bash
 ./.venv/bin/pytest -q
