@@ -5,6 +5,7 @@ IMAGE="${IMAGE:-portfolio-tracker:local}"
 CONTAINER="${CONTAINER:-portfolio-tracker}"
 APPDATA_DIR="${APPDATA_DIR:-/mnt/user/appdata/portfolio-tracker}"
 PORT="${PORT:-5055}"
+HOST_IP="${HOST_IP:-192.168.200.196}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 cd "$ROOT_DIR"
@@ -19,7 +20,7 @@ docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 docker run -d \
   --name "$CONTAINER" \
   --restart unless-stopped \
-  -p "${PORT}:5055" \
+  -p "${HOST_IP}:${PORT}:5055" \
   --env PORTFOLIO_TRACKER_HOME=/data \
   --mount "type=bind,src=${APPDATA_DIR},dst=/data" \
   --security-opt no-new-privileges:true \

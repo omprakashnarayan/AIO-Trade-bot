@@ -43,10 +43,10 @@ The container stores its SQLite database and reports in `/data` and runs as a no
 ./scripts/deploy_unraid.sh
 ```
 
-Override the Unraid appdata location if needed:
+Override the Unraid appdata location or host IP if needed:
 
 ```bash
-APPDATA_DIR=/mnt/user/appdata/aiotradebot ./scripts/deploy_unraid.sh
+APPDATA_DIR=/mnt/user/appdata/aiotradebot HOST_IP=192.168.200.196 ./scripts/deploy_unraid.sh
 ```
 
 Verify deployment with:
