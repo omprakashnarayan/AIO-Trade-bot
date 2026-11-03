@@ -37,7 +37,19 @@ Override values when needed:
 IMAGE=registry.example/portfolio-tracker:latest PORT=5055 ./scripts/deploy_docker.sh
 ```
 
-The container stores its SQLite database and reports in `/data` and runs as a non-root user with a read-only root filesystem. Verify deployment with:
+The container stores its SQLite database and reports in `/data` and runs as a non-root user with a read-only root filesystem. On Unraid, use the host-path deployment script so state is stored on the array/cache under `/mnt/user/appdata/portfolio-tracker`:
+
+```bash
+./scripts/deploy_unraid.sh
+```
+
+Override the Unraid appdata location if needed:
+
+```bash
+APPDATA_DIR=/mnt/user/appdata/aiotradebot ./scripts/deploy_unraid.sh
+```
+
+Verify deployment with:
 
 ```bash
 docker ps --filter name=portfolio-tracker
