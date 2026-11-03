@@ -127,3 +127,34 @@ Live trading must remain disabled until every gate below is completed and docume
 9. Require explicit human approval for each initial live order and begin with tiny notional limits. If any gate is unknown or fails, fail closed and continue in paper or read-only mode.
 
 Until these gates are satisfied, Kite and Upstox live writes remain disabled and INDmoney remains read-only.
+
+## Operator console security and usage
+
+The Flask console is locked until all required admin variables are present. It never accepts or stores a plaintext password. Generate a hash interactively on the Unraid host (the plaintext is not written to shell history):
+
+```bash
+python3 -c 'from getpass import getpass; from werkzeug.security import generate_password_hash; print(generate_password_hash(getpass()))'
+```
+
+Set these exact Unraid container environment variables and restart the container:
+
+```text
+PORTFOLIO_ADMIN_USERNAME=admin
+PORTFOLIO_ADMIN_PASSWORD_HASH=<output from the command above>
+PORTFOLIO_SESSION_SECRET=<random 32+ byte secret>
+PORTFOLIO_ALLOWED_CIDRS=192.168.1.0/24,127.0.0.1/32
+PORTFOLIO_SCHEDULER_ENABLED=false
+# Optional risk gates:
+PORTFOLIO_MAX_ORDER_NOTIONAL=100000
+PORTFOLIO_MAX_POSITION_WEIGHT=0.25
+# Optional connector declarations only; this console makes no provider calls:
+KITE_MCP_ENDPOINT=
+UPSTOX_MCP_ENDPOINT=
+INDMONEY_MCP_ENDPOINT=
+```
+
+`PORTFOLIO_ALLOWED_CIDRS` is mandatory for LAN access. If omitted, only loopback (`127.0.0.1` and `::1`) is allowed; the application does not guess the Unraid subnet. Replace `192.168.1.0/24` with the actual LAN CIDR, and do not include a public or Docker-wide range.
+
+Open `http://<unraid-host>:5055/`, sign in, and use the navigation for Portfolio, Trades, Integrations, Strategies, Scheduler, Audit/Risk, and Settings. Paper orders are submitted only through `ExecutionGateway` and are subject to risk checks, cash/position checks, idempotency, and the persistent global kill switch. Strategy endpoints generate proposals from supplied facts and do not call providers. Sync controls report an unconfigured connector honestly rather than pretending a sync occurred.
+
+Future LIVE proposals can be placed in the append-only approval queue through `/api/approvals` and reviewed in Audit/Risk. Approval is recorded and audited, but it does not enable execution: LIVE submission remains rejected by the gateway.

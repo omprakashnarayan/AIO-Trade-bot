@@ -97,6 +97,16 @@ CREATE TABLE IF NOT EXISTS scheduler_runs (
     created_at TEXT NOT NULL, PRIMARY KEY (trigger_id, scheduled_at)
 );
 CREATE INDEX IF NOT EXISTS idx_scheduler_runs_created ON scheduler_runs(created_at);
+CREATE TABLE IF NOT EXISTS live_approvals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, proposal_id TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL CHECK (status IN ('pending','approved','rejected')),
+    proposal_payload TEXT NOT NULL CHECK (length(proposal_payload) > 0),
+    requested_by TEXT NOT NULL, decided_by TEXT, decision_note TEXT DEFAULT '',
+    created_at TEXT NOT NULL, decided_at TEXT
+);
+CREATE TABLE IF NOT EXISTS console_state (
+    key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL
+);
 """
 
 
@@ -731,6 +741,41 @@ class Database:
 
     def list_transactions(self, limit: int = 100) -> list[sqlite3.Row]:
         with self.connect() as conn: return conn.execute("SELECT * FROM transactions ORDER BY trade_date DESC, id DESC LIMIT ?", (limit,)).fetchall()
+
+    def list_live_approvals(self, status: str | None = None) -> list[sqlite3.Row]:
+        query = "SELECT * FROM live_approvals"
+        params: tuple[Any, ...] = ()
+        if status is not None:
+            if status not in {"pending", "approved", "rejected"}:
+                raise ValueError("invalid approval status")
+            query += " WHERE status=?"; params = (status,)
+        query += " ORDER BY id DESC"
+        with self.connect() as conn:
+            return conn.execute(query, params).fetchall()
+
+    def create_live_approval(self, *, proposal_id: str, proposal_payload: Any, requested_by: str) -> int:
+        now = datetime.now(timezone.utc).isoformat()
+        with self.connect() as conn:
+            cur = conn.execute("INSERT INTO live_approvals(proposal_id,status,proposal_payload,requested_by,created_at) VALUES(?,?,?,?,?)", (proposal_id, "pending", _canonical_json(proposal_payload, "proposal payload"), requested_by, now))
+            return int(cur.lastrowid)
+
+    def decide_live_approval(self, approval_id: int, *, status: str, decided_by: str, note: str = "") -> bool:
+        if status not in {"approved", "rejected"}:
+            raise ValueError("approval decision must be approved or rejected")
+        now = datetime.now(timezone.utc).isoformat()
+        with self.connect() as conn:
+            cur = conn.execute("UPDATE live_approvals SET status=?, decided_by=?, decision_note=?, decided_at=? WHERE id=? AND status='pending'", (status, decided_by, note, now, approval_id))
+            return cur.rowcount == 1
+
+    def get_console_state(self, key: str, default: str = "") -> str:
+        with self.connect() as conn:
+            row = conn.execute("SELECT value FROM console_state WHERE key=?", (key,)).fetchone()
+            return str(row["value"]) if row else default
+
+    def set_console_state(self, key: str, value: str) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self.connect() as conn:
+            conn.execute("INSERT INTO console_state(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at", (key, value, now))
 
     def get_price_cache(self, portfolio: str, symbol: str) -> sqlite3.Row | None:
         with self.connect() as conn: return conn.execute("SELECT * FROM price_cache WHERE portfolio=? AND symbol=?", (portfolio, symbol.upper())).fetchone()

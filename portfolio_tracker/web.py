@@ -1,16 +1,108 @@
 from __future__ import annotations
 
+import ipaddress
+import json
 import math
+import os
+import secrets
+from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any
 
-from flask import Flask, jsonify, redirect, render_template_string, request, url_for
+from flask import Flask, jsonify, redirect, render_template_string, request, session, url_for
+from werkzeug.security import check_password_hash
 
 from .config import load_settings, save_settings
 from .db import Database
+from .execution import ExecutionGateway, LiveModeRejected
 from .reporting import generate_report
+from .risk import RiskEngine, RiskLimits
+from .strategies import MarketFact, PortfolioFact, StrategyInputError, propose_kite_short_term, propose_upstox_long_term, propose_indmoney_us_tracking
+from .trading_models import ExecutionMode, OrderIntent, OrderSide, OrderType, TimeInForce
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("PORTFOLIO_SESSION_SECRET") or secrets.token_hex(32)
 
+
+def _allowed_networks() -> tuple[ipaddress._BaseNetwork, ...]:
+    raw = os.environ.get("PORTFOLIO_ALLOWED_CIDRS", "").strip()
+    if not raw:
+        return (ipaddress.ip_network("127.0.0.1/32"), ipaddress.ip_network("::1/128"))
+    networks = []
+    for value in raw.split(","):
+        try:
+            networks.append(ipaddress.ip_network(value.strip(), strict=False))
+        except ValueError:
+            continue
+    return tuple(networks)
+
+
+def _credentials_configured() -> bool:
+    return bool(os.environ.get("PORTFOLIO_ADMIN_USERNAME", "").strip() and os.environ.get("PORTFOLIO_ADMIN_PASSWORD_HASH", "").strip())
+
+
+def _request_allowed() -> bool:
+    try:
+        address = ipaddress.ip_address(request.remote_addr or "")
+    except ValueError:
+        return False
+    return any(address in network for network in _allowed_networks())
+
+
+SETUP_TEMPLATE = """<!doctype html><title>Portfolio Tracker setup</title><h1>Console locked</h1><p>Admin credentials are not configured. No portfolio data or mutations are exposed.</p><p>Set <code>PORTFOLIO_ADMIN_USERNAME</code>, <code>PORTFOLIO_ADMIN_PASSWORD_HASH</code>, and <code>PORTFOLIO_SESSION_SECRET</code> in the Unraid container environment, then restart it.</p><p>Generate a password hash without storing plaintext: <code>python -c 'from getpass import getpass; from werkzeug.security import generate_password_hash; print(generate_password_hash(getpass()))'</code></p>"""
+LOGIN_TEMPLATE = """<!doctype html><title>Portfolio Tracker login</title><h1>Operator login</h1>{% if error %}<p>{{ error }}</p>{% endif %}<form method=post><label>Username <input name=username autocomplete=username required></label><label>Password <input name=password type=password autocomplete=current-password required></label><button>Sign in</button></form>"""
+
+
+@app.before_request
+def operator_guard():
+    if not _request_allowed():
+        return jsonify({"error": "request source is outside the configured LAN allowlist"}), 403
+    if request.endpoint in {"setup", "login", "health"}:
+        return None
+    if not _credentials_configured():
+        if request.path.startswith("/api/"):
+            return jsonify({"error": "admin credentials are not configured; console is locked", "setup_required": True}), 503
+        return redirect(url_for("setup"))
+    if not session.get("operator_authenticated"):
+        if request.path.startswith("/api/"):
+            return jsonify({"error": "authentication required"}), 401
+        return redirect(url_for("login", next=request.path))
+    return None
+
+
+@app.get("/setup")
+def setup():
+    return render_template_string(SETUP_TEMPLATE), 503
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if not _credentials_configured():
+        return render_template_string(SETUP_TEMPLATE), 503
+    error = None
+    if request.method == "POST":
+        username = request.form.get("username", "")
+        password = request.form.get("password", "")
+        try:
+            valid = secrets.compare_digest(username, os.environ["PORTFOLIO_ADMIN_USERNAME"]) and check_password_hash(os.environ["PORTFOLIO_ADMIN_PASSWORD_HASH"], password)
+        except (KeyError, ValueError):
+            valid = False
+        if valid:
+            session.clear(); session["operator_authenticated"] = True
+            return redirect(request.args.get("next") or url_for("index"))
+        error = "Invalid credentials"
+    return render_template_string(LOGIN_TEMPLATE, error=error), 401 if error else 200
+
+
+@app.post("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+
+@app.get("/health")
+def health():
+    return jsonify({"status": "ok", "auth_configured": _credentials_configured(), "paper_only": True})
 
 action_template = """
 <!doctype html>
@@ -42,7 +134,8 @@ action_template = """
 </head>
 <body>
 <div class="shell">
-  <header class="topbar"><div class="brand"><div class="mark">⌁</div><div>PORTFOLIO <span class="muted">// NOC</span></div></div><div class="top-actions"><span class="pill live">● LOCAL / PAPER MODE</span><a class="button" href="{{ url_for('refresh') }}">↻ Refresh snapshot</a><a href="{{ url_for('api_report') }}">JSON report ↗</a></div></header>
+  <header class="topbar"><div class="brand"><div class="mark">⌁</div><div>PORTFOLIO <span class="muted">// NOC</span></div></div><div class="top-actions"><span class="pill live">● LOCAL / PAPER MODE</span><a class="button" href="{{ url_for('refresh') }}">↻ Refresh snapshot</a><a href="{{ url_for('api_report') }}">JSON report ↗</a><form method="post" action="{{ url_for('logout') }}" style="display:inline"><button class="small">Logout</button></form></div></header>
+  <nav class="actions" aria-label="Operator navigation"><a class="button small" href="{{ url_for('index') }}">Portfolio</a><a class="button small" href="{{ url_for('operator_page', section='trades') }}">Trades</a><a class="button small" href="{{ url_for('operator_page', section='integrations') }}">Integrations</a><a class="button small" href="{{ url_for('operator_page', section='strategies') }}">Strategies</a><a class="button small" href="{{ url_for('operator_page', section='scheduler') }}">Scheduler</a><a class="button small" href="{{ url_for('operator_page', section='audit') }}">Audit / Risk</a><a class="button small" href="{{ url_for('operator_page', section='settings') }}">Settings</a></nav>
   <section class="hero"><div class="hero-copy"><div class="eyebrow">Homelab portfolio operations console</div><h1>Signal over noise.</h1><p class="muted">A local-first command center for holdings, price snapshots, and disciplined paper-trading workflows.</p></div><div class="eyebrow">Last scan: {{ snapshot_time }}</div></section>
 
   <section class="grid">
@@ -105,7 +198,7 @@ def _pct(value):
 
 
 def _payload() -> dict[str, Any]:
-    return request.get_json(silent=True) or {}
+    return request.get_json(silent=True) or request.form.to_dict() or {}
 
 
 def _holding_values(payload: dict[str, Any], *, portfolio: str | None = None, symbol: str | None = None) -> dict[str, Any]:
@@ -230,6 +323,220 @@ def refresh():
 def api_report():
     snapshot, markdown, path = generate_report(Database(), save=True)
     return jsonify({"snapshot": snapshot, "report_path": str(path), "markdown": markdown})
+
+
+def _json_rows(rows):
+    result = []
+    for row in rows:
+        item = dict(row)
+        for key, value in list(item.items()):
+            if isinstance(value, bytes):
+                item[key] = value.decode("utf-8", "replace")
+            if key.endswith("payload") and isinstance(value, str):
+                try: item[key] = json.loads(value)
+                except json.JSONDecodeError: pass
+        result.append(item)
+    return result
+
+
+def _decimal_or_none(value):
+    if value in (None, "", False):
+        return None
+    return Decimal(str(value))
+
+
+OPERATOR_PAGE_TEMPLATE = """<!doctype html><title>{{ section|title }} // Portfolio NOC</title><style>body{font:15px system-ui;background:#080d14;color:#dce8f4;margin:0;padding:30px}a{color:#43d9ff}.nav{display:flex;gap:8px;flex-wrap:wrap;margin:20px 0}.card{border:1px solid #203247;background:#0e1723;border-radius:12px;padding:18px;margin:12px 0;max-width:1100px}.muted{color:#8498ad}pre{white-space:pre-wrap;overflow:auto;color:#b9e8f4}button{padding:8px 12px;background:#123344;color:white;border:1px solid #2b6277;border-radius:6px}input{padding:8px;background:#09121d;color:white;border:1px solid #203247;border-radius:6px}</style><h1>{{ section|title }}</h1><div class=nav><a href="/">Portfolio</a><a href="/page/trades">Trades</a><a href="/page/integrations">Integrations</a><a href="/page/strategies">Strategies</a><a href="/page/scheduler">Scheduler</a><a href="/page/audit">Audit / Risk</a><a href="/page/settings">Settings</a></div><div class=card><p class=muted>{{ description }}</p>{% if section == 'scheduler' %}<form method=post action="/api/scheduler/state"><label>Enabled <input name=enabled value="{{ 'true' if data.enabled else 'false' }}"></label><button>Save scheduler state</button></form><form method=post action="/api/scheduler/run" style="margin-top:10px"><button>Run due proposals</button></form>{% elif section == 'audit' %}<form method=post action="/api/risk/kill-switch"><label>Kill switch state <input name=state value="{{ 'on' if data.kill_switch == 'on' else 'off' }}"></label><button>Set kill switch</button></form>{% elif section == 'integrations' %}<p class=muted>Sync is intentionally API-controlled and returns a truthful no-call result for unconfigured connectors.</p>{% endif %}<pre>{{ data|tojson(indent=2) }}</pre></div>"""
+
+
+@app.get("/page/<section>")
+def operator_page(section: str):
+    if section not in {"trades", "integrations", "strategies", "scheduler", "audit", "settings"}:
+        return jsonify({"error": "unknown operator page"}), 404
+    db = Database(); db.init_db()
+    if section == "trades": data = {"orders": _json_rows(db.list_order_intents()), "transactions": _json_rows(db.list_transactions())}
+    elif section == "integrations": data = _integration_status()
+    elif section == "scheduler": data = _scheduler_snapshot(db)
+    elif section == "audit": data = {"kill_switch": db.get_console_state("global_kill_switch", "off"), "events": _json_rows(db.list_audit_events(limit=100)), "approvals": _json_rows(db.list_live_approvals())}
+    elif section == "settings": data = load_settings()
+    else: data = {"paper_only": True, "supported": ["kite-short-term/v1", "upstox-long-term/v1", "indmoney-us-read-only/v1"], "note": "Strategies accept caller-supplied facts only and never submit orders."}
+    descriptions = {"trades": "Paper orders use the execution gateway; manual transactions remain local ledger records.", "integrations": "Provider connectors are reported honestly from configuration only; no network calls are made.", "strategies": "Generate expiring proposals from supplied facts; proposals do not execute.", "scheduler": "Durable scheduler state and run outcomes.", "audit": "Append-only events, risk posture, kill switch, and live approval records.", "settings": "Local operator preferences and deployment posture."}
+    return render_template_string(OPERATOR_PAGE_TEMPLATE, section=section, description=descriptions[section], data=data)
+
+
+def _integration_status():
+    return {name: {"configured": bool(os.environ.get(env)), "status": "configured boundary; no external call" if os.environ.get(env) else "unconfigured MCP connector", "live_writes": False, "read_only": name == "indmoney"} for name, env in (("kite", "KITE_MCP_ENDPOINT"), ("upstox", "UPSTOX_MCP_ENDPOINT"), ("indmoney", "INDMONEY_MCP_ENDPOINT"))}
+
+
+def _scheduler_snapshot(db: Database):
+    with db.connect() as conn:
+        state = _json_rows(conn.execute("SELECT * FROM scheduler_state ORDER BY trigger_id").fetchall())
+        runs = _json_rows(conn.execute("SELECT * FROM scheduler_runs ORDER BY created_at DESC LIMIT 100").fetchall())
+    return {"enabled": db.get_console_state("scheduler_enabled", os.environ.get("PORTFOLIO_SCHEDULER_ENABLED", "false")).lower() == "true", "state": state, "runs": runs}
+
+
+@app.get("/api/portfolio")
+def api_portfolio():
+    snapshot, _, path = generate_report(Database(), save=True)
+    return jsonify({"snapshot": snapshot, "report_path": str(path)})
+
+
+@app.get("/api/transactions")
+def api_list_transactions():
+    db = Database(); db.init_db()
+    return jsonify({"transactions": _json_rows(db.list_transactions(int(request.args.get("limit", 100))))})
+
+
+@app.post("/api/transactions")
+def api_create_transaction():
+    payload = _payload()
+    try:
+        db = Database(); db.init_db()
+        db.adjust_holding(symbol=str(payload["symbol"]).strip().upper(), delta_shares=payload["shares"], trade_price=payload["price"], side=str(payload["side"]).lower(), fees=payload.get("fees", 0), trade_date=payload.get("trade_date"), notes=str(payload.get("notes", "")), portfolio=str(payload.get("portfolio", "Main")), currency=str(payload.get("currency", "INR")))
+    except (KeyError, TypeError, ValueError) as exc:
+        return jsonify({"error": str(exc)}), 400
+    db.append_audit_event(event_type="manual.transaction.created", entity_type="transaction", entity_id=str(payload.get("symbol")), payload=payload, mode="paper")
+    return jsonify({"status": "created", "transactions": _json_rows(db.list_transactions(1))}), 201
+
+
+@app.route("/api/transactions/<int:transaction_id>", methods=["PUT", "PATCH", "DELETE"])
+def api_transaction_mutation(transaction_id: int):
+    return jsonify({"error": "transactions are append-only; create/read only", "transaction_id": transaction_id}), 405
+
+
+@app.get("/api/orders")
+def api_list_orders():
+    db = Database(); db.init_db()
+    return jsonify({"orders": _json_rows(db.list_order_intents(request.args.get("status")))})
+
+
+@app.post("/api/orders/paper")
+def api_paper_order():
+    payload = _payload()
+    if str(payload.get("mode", "paper")).lower() == "live":
+        return jsonify({"error": "LIVE orders are disabled; create an approval record instead"}), 409
+    try:
+        intent = OrderIntent(idempotency_key=str(payload["idempotency_key"]), portfolio_id=payload.get("portfolio_id", "Main"), account_id=payload.get("account_id"), symbol=str(payload["symbol"]), side=OrderSide(str(payload["side"]).lower()), order_type=OrderType.MARKET, time_in_force=TimeInForce.DAY, quantity=payload["quantity"], currency=str(payload.get("currency", "INR")), mode=ExecutionMode.PAPER, broker_id="paper")
+        db = Database(); db.init_db()
+        limits = RiskLimits(global_kill_switch=db.get_console_state("global_kill_switch", "off") == "on", max_order_notional=_decimal_or_none(os.environ.get("PORTFOLIO_MAX_ORDER_NOTIONAL")), max_position_weight=_decimal_or_none(os.environ.get("PORTFOLIO_MAX_POSITION_WEIGHT")))
+        gateway = ExecutionGateway(db, risk=RiskEngine(limits=limits, db=db))
+        decision = gateway.submit(intent, quote_price=payload["quote_price"], portfolio_value=payload.get("portfolio_value"), current_position_notional=payload.get("current_position_notional", "0"))
+        result = {"status": decision.status, "risk": {"allowed": decision.risk.allowed, "code": decision.risk.code, "message": decision.risk.message, "details": decision.risk.details}, "error": decision.error}
+        if decision.broker_result: result["order"] = {"order_id": decision.broker_result.order_id, "status": decision.broker_result.status, "cash_balance": str(decision.broker_result.cash_balance), "total": str(decision.broker_result.total), "reused": decision.broker_result.reused}
+        return jsonify(result), 200 if decision.status != "rejected" else 422
+    except LiveModeRejected as exc:
+        return jsonify({"error": str(exc), "live_enabled": False}), 409
+    except (KeyError, TypeError, ValueError) as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.get("/api/integrations")
+def api_integrations():
+    return jsonify({"integrations": _integration_status()})
+
+
+@app.post("/api/integrations/<name>/sync")
+def api_integration_sync(name: str):
+    status = _integration_status().get(name)
+    if status is None: return jsonify({"error": "unknown integration"}), 404
+    return jsonify({"integration": name, "status": "not run", "message": "No provider call made; connector is not configured through this console."}), 409
+
+
+@app.get("/api/strategies")
+def api_strategies():
+    return jsonify({"strategies": ["kite-short-term/v1", "upstox-long-term/v1", "indmoney-us-read-only/v1"], "execution": "proposals only"})
+
+
+@app.post("/api/strategies/proposals")
+def api_strategy_proposal():
+    payload = _payload()
+    if str(payload.get("mode", "paper")).lower() == "live":
+        return jsonify({"error": "live proposals require an explicit approval record and are not executable"}), 409
+    try:
+        now = datetime.fromisoformat(str(payload.get("now") or datetime.now(timezone.utc).isoformat()))
+        fact = MarketFact(str(payload["symbol"]), str(payload["market"]), str(payload["currency"]), payload["price"], datetime.fromisoformat(str(payload["as_of"])), str(payload.get("source_id", "operator-input")), str(payload.get("signal", "hold")), payload.get("quantity", "1"), tuple(payload.get("evidence", [])))
+        portfolio = PortfolioFact(str(payload.get("portfolio_id", "Main")), str(payload.get("account_id", "operator")), str(payload.get("broker_id", "kite")), fact.market, fact.currency)
+        strategy = str(payload.get("strategy", "kite-short-term/v1"))
+        if strategy == "kite-short-term/v1": result = propose_kite_short_term(fact, portfolio, now=now)
+        elif strategy == "upstox-long-term/v1": result = propose_upstox_long_term(fact, portfolio, now=now)
+        elif strategy == "indmoney-us-read-only/v1": result = propose_indmoney_us_tracking(fact, PortfolioFact(portfolio.portfolio_id, portfolio.account_id, "indmoney", "US", "USD"), now=now)
+        else: return jsonify({"error": "unknown strategy"}), 400
+        db = Database(); db.init_db(); db.append_audit_event(event_type="strategy.proposal.generated", entity_type="proposal", entity_id=str(getattr(result, "strategy", strategy)), payload=result.to_dict(), broker_id=portfolio.broker_id, account_id=portfolio.account_id, portfolio_id=portfolio.portfolio_id, mode="paper")
+        return jsonify(result.to_dict())
+    except (KeyError, TypeError, ValueError, StrategyInputError) as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.get("/api/scheduler")
+def api_scheduler():
+    return jsonify(_scheduler_snapshot(Database()))
+
+
+@app.post("/api/scheduler/state")
+def api_scheduler_state():
+    payload = _payload(); value = str(payload.get("enabled", "")).lower()
+    if value not in {"true", "false", "on", "off"}: return jsonify({"error": "enabled must be boolean"}), 400
+    enabled = value in {"true", "on"}
+    db = Database(); db.init_db(); db.set_console_state("scheduler_enabled", "true" if enabled else "false")
+    db.append_audit_event(event_type="scheduler.state.changed", entity_type="scheduler", entity_id="operator", payload={"enabled": enabled}, mode="paper")
+    return jsonify({"enabled": enabled})
+
+
+@app.post("/api/scheduler/run")
+def api_scheduler_run():
+    db = Database(); db.init_db(); db.append_audit_event(event_type="scheduler.manual_run", entity_type="scheduler", entity_id="operator", payload={"requested": True}, mode="paper")
+    return jsonify({"status": "accepted", "generated": 0, "message": "No external strategy factories are registered by the console; no provider call was made."})
+
+
+@app.get("/api/audit")
+def api_audit():
+    db = Database(); db.init_db()
+    return jsonify({"events": _json_rows(db.list_audit_events(limit=200)), "approvals": _json_rows(db.list_live_approvals())})
+
+
+@app.get("/api/risk")
+def api_risk():
+    db = Database(); db.init_db()
+    return jsonify({"paper_only": True, "live_writes": False, "global_kill_switch": db.get_console_state("global_kill_switch", "off") == "on", "max_order_notional": os.environ.get("PORTFOLIO_MAX_ORDER_NOTIONAL"), "max_position_weight": os.environ.get("PORTFOLIO_MAX_POSITION_WEIGHT")})
+
+
+@app.post("/api/risk/kill-switch")
+def api_kill_switch():
+    payload = _payload(); value = str(payload.get("state", "")).lower()
+    if value not in {"on", "off"}: return jsonify({"error": "state must be on or off"}), 400
+    db = Database(); db.init_db(); db.set_console_state("global_kill_switch", value); db.append_audit_event(event_type="risk.kill_switch.changed", entity_type="risk", entity_id="global", payload={"state": value}, mode="paper")
+    return jsonify({"global_kill_switch": value == "on"})
+
+
+@app.get("/api/approvals")
+def api_approvals():
+    db = Database(); db.init_db(); return jsonify({"approvals": _json_rows(db.list_live_approvals(request.args.get("status")))})
+
+
+@app.post("/api/approvals")
+def api_create_approval():
+    payload = _payload(); proposal = payload.get("proposal", payload)
+    if not isinstance(proposal, dict): return jsonify({"error": "proposal must be an object"}), 400
+    if str(proposal.get("mode", "live")).lower() != "live": return jsonify({"error": "approval records are only for future LIVE proposals"}), 400
+    proposal_id = str(payload.get("proposal_id") or proposal.get("proposal_id") or "")
+    if not proposal_id: return jsonify({"error": "proposal_id is required"}), 400
+    db = Database(); db.init_db()
+    try: approval_id = db.create_live_approval(proposal_id=proposal_id, proposal_payload=proposal, requested_by=str(session.get("operator", os.environ.get("PORTFOLIO_ADMIN_USERNAME", "operator"))))
+    except (ValueError, Exception) as exc:
+        if "UNIQUE" in str(exc): return jsonify({"error": "proposal already has an approval record"}), 409
+        return jsonify({"error": str(exc)}), 400
+    db.append_audit_event(event_type="live.approval.requested", entity_type="approval", entity_id=str(approval_id), payload={"proposal_id": proposal_id}, mode="live")
+    return jsonify({"id": approval_id, "status": "pending", "execution": "disabled"}), 201
+
+
+@app.post("/api/approvals/<int:approval_id>/decision")
+def api_decide_approval(approval_id: int):
+    payload = _payload(); status = str(payload.get("status", ""))
+    db = Database(); db.init_db()
+    try: changed = db.decide_live_approval(approval_id, status=status, decided_by=str(session.get("operator", os.environ.get("PORTFOLIO_ADMIN_USERNAME", "operator"))), note=str(payload.get("note", "")))
+    except ValueError as exc: return jsonify({"error": str(exc)}), 400
+    if not changed: return jsonify({"error": "approval not found or already decided"}), 404
+    db.append_audit_event(event_type="live.approval.decided", entity_type="approval", entity_id=str(approval_id), payload={"status": status}, mode="live")
+    return jsonify({"id": approval_id, "status": status, "execution": "still disabled"})
 
 
 def main(host: str = "127.0.0.1", port: int = 5055, debug: bool = False):
