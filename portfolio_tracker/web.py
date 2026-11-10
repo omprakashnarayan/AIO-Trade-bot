@@ -14,6 +14,7 @@ from werkzeug.security import check_password_hash
 
 from .config import DEFAULT_SETTINGS, load_settings, save_settings
 from .agents import AGENTS, list_agents, retry_agent, run_agent
+from . import integration_auth
 from .db import Database
 from .execution import ExecutionGateway, LiveModeRejected
 from .reporting import generate_report
@@ -89,7 +90,7 @@ def login():
         except (KeyError, ValueError):
             valid = False
         if valid:
-            session.clear(); session["operator_authenticated"] = True
+            session.clear(); session["operator_authenticated"] = True; session["csrf_token"] = secrets.token_urlsafe(32)
             return redirect(request.args.get("next") or url_for("index"))
         error = "Invalid credentials"
     return render_template_string(LOGIN_TEMPLATE, error=error), 401 if error else 200
@@ -202,6 +203,28 @@ def _payload() -> dict[str, Any]:
     return request.get_json(silent=True) or request.form.to_dict() or {}
 
 
+def _csrf_token() -> str:
+    token = session.get("csrf_token")
+    if not token:
+        token = secrets.token_urlsafe(32)
+        session["csrf_token"] = token
+    return token
+
+
+def _csrf_ok() -> bool:
+    supplied = request.headers.get("X-CSRF-Token") or request.form.get("csrf_token") or (_payload().get("csrf_token") if request.is_json else None)
+    expected = session.get("csrf_token")
+    return bool(expected and supplied and secrets.compare_digest(str(expected), str(supplied)))
+
+
+def _integration_secret_key() -> str:
+    return str(app.secret_key)
+
+
+def _integration_status() -> dict[str, dict[str, Any]]:
+    return {name: integration_auth.status(_integration_secret_key(), name) for name in integration_auth.PROVIDERS}
+
+
 def _holding_values(payload: dict[str, Any], *, portfolio: str | None = None, symbol: str | None = None) -> dict[str, Any]:
     portfolio = str(payload.get("portfolio", portfolio or "Main")).strip() or "Main"
     symbol = str(payload.get("symbol", symbol or "")).strip().upper()
@@ -223,7 +246,7 @@ def _row_json(row):
 
 @app.context_processor
 def inject_helpers():
-    return {"money": _money, "pct": _pct}
+    return {"money": _money, "pct": _pct, "csrf_token": _csrf_token()}
 
 
 @app.get("/")
@@ -387,7 +410,8 @@ OPERATOR_PAGE_TEMPLATE = """
 {% elif section == 'trades' %}
 <div class="grid"><div class="card span-6"><h2>Place paper order</h2><form id="paper-order" class="form-grid"><label>Symbol<input name="symbol" placeholder="INFY" required></label><label>Side<select name="side"><option>buy</option><option>sell</option></select></label><label>Quantity<input name="quantity" type="number" step="0.0001" required></label><label>Quote price<input name="quote_price" type="number" step="0.01" required></label><label>Currency<input name="currency" value="INR"></label><label>Account ID<input name="account_id" value="operator"></label><label>Portfolio ID<input name="portfolio_id" value="Main"></label><label>Idempotency key<input name="idempotency_key" required></label><div class="actions"><button>Submit paper order</button><button type="button" class="danger" onclick="postJson('/api/risk/kill-switch',{state:'on'})">Enable kill switch</button></div></form><div id="result" class="status">Ready.</div></div><div class="card span-6"><h2>Order history</h2><div class="table-wrap"><table><tr><th>ID</th><th>Symbol</th><th>Side</th><th>Status</th><th>Mode</th></tr>{% for o in data.orders %}<tr><td>{{ o.id }}</td><td>{{ o.symbol if o.symbol is defined else o.order_payload }}</td><td>{{ o.side if o.side is defined else '' }}</td><td>{{ o.status }}</td><td>{{ o.mode }}</td></tr>{% else %}<tr><td colspan="5" class="muted">No orders yet.</td></tr>{% endfor %}</table></div></div></div>
 {% elif section == 'integrations' %}
-<div class="grid">{% for name,status in data.items() %}<div class="card span-6"><h2>{{ name|upper }}</h2><p class="muted">{{ status.status }}</p><p>Configured: <strong>{{ 'yes' if status.configured else 'no' }}</strong> · Live writes: <strong>{{ 'yes' if status.live_writes else 'no' }}</strong> · Read-only: <strong>{{ 'yes' if status.read_only else 'no' }}</strong></p><button onclick="syncIntegration('{{ name }}')">Check / sync {{ name|upper }}</button></div>{% endfor %}</div><div id="result" class="status">No provider call has been made.</div>
+<div class="grid">{% for name,status in data.items() %}<div class="card span-6"><h2>{{ name|upper }}</h2><p class="muted">{{ status.status|capitalize }} · Last authorized: {{ status.last_authorized_at or 'never' }} · Expires: {{ status.expires_at or 'n/a' }}</p><p>Configured: <strong>{{ 'yes' if status.configured else 'no' }}</strong> · Connected: <strong>{{ 'yes' if status.connected else 'no' }}</strong> · Live writes: <strong>no</strong></p><p class="muted">Read/status: {{ 'yes' if status.capabilities.read else 'no' }} · Reconciliation: {{ 'yes' if status.capabilities.reconciliation else 'no' }} · Trading: no</p>{% if name == 'indmoney' %}<a class="button" href="{{ url_for('indmoney_connect') }}">Connect via official MCP handoff</a><form method="post" action="{{ url_for('integration_disconnect', name=name) }}" style="display:inline"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="danger">Disconnect local status</button></form>{% else %}<form method="post" action="{{ url_for('integration_config', name=name) }}" class="form-grid"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% if name == 'kite' %}<label>API key<input name="api_key" type="text" autocomplete="off" placeholder="leave blank to keep saved"></label><label>API secret<input name="api_secret" type="password" autocomplete="new-password" placeholder="leave blank to keep saved"></label>{% else %}<label>Client ID<input name="client_id" type="text" autocomplete="off" placeholder="leave blank to keep saved"></label><label>Client secret<input name="client_secret" type="password" autocomplete="new-password" placeholder="leave blank to keep saved"></label>{% endif %}<label>Redirect URL<input name="redirect_uri" type="url" required value="{{ status.redirect_uri or '' }}"></label><button>Save encrypted app config</button></form><div class="actions"><form method="post" action="{{ url_for('integration_start', name=name) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button>{{ 'Reconnect' if status.connected else 'Connect' }} {{ name|upper }}</button></form><form method="post" action="{{ url_for('integration_disconnect', name=name) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="danger">Disconnect</button></form></div>{% endif %}</div>{% endfor %}</div><div class="card"><p><strong>Safety boundary:</strong> provider tokens are only for read/status/reconciliation. Live order writes remain disabled.</p></div>
+
 {% elif section == 'strategies' %}
 <div class="card"><h2>Generate proposal</h2><form id="strategy-form" class="form-grid"><label>Strategy<select name="strategy"><option>kite-short-term/v1</option><option>upstox-long-term/v1</option><option>indmoney-us-read-only/v1</option></select></label><label>Symbol<input name="symbol" value="INFY" required></label><label>Market<input name="market" value="INDIA"></label><label>Currency<input name="currency" value="INR"></label><label>Price<input name="price" type="number" step="0.01" required></label><label>Signal<select name="signal"><option>buy</option><option>sell</option><option>hold</option></select></label><label>Quantity<input name="quantity" value="1"></label><label>Source ID<input name="source_id" value="operator-input"></label><div class="actions"><button>Generate paper proposal</button></div></form><div id="result" class="status">Proposals are suggestions only and do not execute.</div></div>
 {% elif section == 'scheduler' %}
@@ -422,10 +446,6 @@ def operator_page(section: str):
     else: data = {"paper_only": True, "supported": ["kite-short-term/v1", "upstox-long-term/v1", "indmoney-us-read-only/v1"], "note": "Strategies accept caller-supplied facts only and never submit orders."}
     descriptions = {"agents": "Enable, disable, test, run, retry, and inspect durable local agents.", "trades": "Paper orders use the execution gateway; manual transactions remain local ledger records.", "integrations": "Provider connectors are reported honestly from configuration only; no network calls are made.", "strategies": "Generate expiring proposals from supplied facts; proposals do not execute.", "scheduler": "Durable scheduler state and run outcomes.", "audit": "Append-only events, risk posture, kill switch, and live approval records.", "settings": "Local operator preferences and deployment posture."}
     return render_template_string(OPERATOR_PAGE_TEMPLATE, section=section, description=descriptions[section], data=data)
-
-
-def _integration_status():
-    return {name: {"configured": bool(os.environ.get(env)), "status": "configured boundary; no external call" if os.environ.get(env) else "unconfigured MCP connector", "live_writes": False, "read_only": name == "indmoney"} for name, env in (("kite", "KITE_MCP_ENDPOINT"), ("upstox", "UPSTOX_MCP_ENDPOINT"), ("indmoney", "INDMONEY_MCP_ENDPOINT"))}
 
 
 def _scheduler_snapshot(db: Database):
@@ -546,11 +566,90 @@ def api_integrations():
     return jsonify({"integrations": _integration_status()})
 
 
+@app.post("/integrations/<name>/config")
+@app.post("/api/integrations/<name>/config")
+def integration_config(name: str):
+    if name not in {"kite", "upstox"}:
+        return jsonify({"error": "INDmoney has no app credentials or trading OAuth configuration"}), 405
+    if not _csrf_ok():
+        return jsonify({"error": "CSRF validation failed"}), 403
+    payload = _payload()
+    fields = ("api_key", "api_secret", "redirect_uri") if name == "kite" else ("client_id", "client_secret", "redirect_uri")
+    try:
+        existing = integration_auth.get_provider(_integration_secret_key(), name)
+    except (KeyError, RuntimeError) as exc:
+        return jsonify({"error": str(exc)}), 500
+    if any(not str(payload.get(key, "")).strip() and not existing.get(key) for key in fields):
+        return jsonify({"error": "missing required provider app field"}), 400
+    values = {key: str(payload[key]) for key in fields if str(payload.get(key, "")).strip()}
+    try:
+        integration_auth.save_config(_integration_secret_key(), name, values)
+    except (KeyError, RuntimeError) as exc:
+        return jsonify({"error": str(exc)}), 500
+    return redirect(url_for("operator_page", section="integrations")) if request.path.startswith("/integrations/") else jsonify(integration_auth.status(_integration_secret_key(), name))
+
+
+@app.post("/integrations/<name>/start")
+@app.post("/api/integrations/<name>/connect")
+def integration_start(name: str):
+    if name not in {"kite", "upstox"}:
+        return redirect(url_for("indmoney_connect")) if request.path.startswith("/integrations/") else (jsonify({"error": "INDmoney requires an MCP-capable client handoff"}), 409)
+    if not _csrf_ok():
+        return jsonify({"error": "CSRF validation failed"}), 403
+    try:
+        state = secrets.token_urlsafe(32)
+        session["oauth_state"] = {"provider": name, "value": state}
+        return redirect(integration_auth.authorization_url(_integration_secret_key(), name, state))
+    except (KeyError, ValueError, RuntimeError) as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.get("/oauth/<name>/callback")
+def oauth_callback(name: str):
+    if name not in {"kite", "upstox"}:
+        return jsonify({"error": "unknown OAuth provider"}), 404
+    expected = session.get("oauth_state") or {}
+    if not expected or expected.get("provider") != name or not request.args.get("state") or not secrets.compare_digest(str(expected.get("value")), str(request.args.get("state"))):
+        return jsonify({"error": "invalid or expired OAuth state"}), 400
+    session.pop("oauth_state", None)
+    if request.args.get("error"):
+        return jsonify({"error": "provider authorization was denied", "provider_error": request.args.get("error")} ), 400
+    code = request.args.get("request_token" if name == "kite" else "code")
+    if not code:
+        return jsonify({"error": "provider callback code is missing"}), 400
+    try:
+        integration_auth.exchange_code(_integration_secret_key(), name, code)
+    except (KeyError, ValueError, RuntimeError, OSError):
+        return jsonify({"error": "provider token exchange failed"}), 400
+    return redirect(url_for("operator_page", section="integrations"))
+
+
+@app.post("/integrations/<name>/disconnect")
+@app.post("/api/integrations/<name>/disconnect")
+def integration_disconnect(name: str):
+    if name not in integration_auth.PROVIDERS:
+        return jsonify({"error": "unknown integration"}), 404
+    if not _csrf_ok():
+        return jsonify({"error": "CSRF validation failed"}), 403
+    integration_auth.disconnect(_integration_secret_key(), name)
+    return redirect(url_for("operator_page", section="integrations")) if request.path.startswith("/integrations/") else jsonify(integration_auth.status(_integration_secret_key(), name))
+
+
+@app.get("/integrations/indmoney/connect")
+def indmoney_connect():
+    return render_template_string("""<!doctype html><title>INDmoney MCP handoff</title><h1>Connect INDmoney through its official MCP client</h1><p>INDmoney MCP is read-only and cannot place trades, transfer money, or change account settings.</p><p>Open the official MCP endpoint in an MCP-capable client and complete sign-in and consent there:</p><p><code>https://mcp.indmoney.com/mcp</code></p><p>This Flask app does not receive or verify an INDmoney token, so its status remains unconnected.</p><p><a href=\"{{ url_for('operator_page', section='integrations') }}\">Back to Integrations</a></p>""")
+
+
 @app.post("/api/integrations/<name>/sync")
 def api_integration_sync(name: str):
     status = _integration_status().get(name)
     if status is None: return jsonify({"error": "unknown integration"}), 404
-    return jsonify({"integration": name, "status": "not run", "message": "No provider call made; connector is not configured through this console."}), 409
+    return jsonify({"integration": name, "status": status["status"], "message": "Provider calls are limited to explicit browser OAuth callbacks; live writes are disabled."})
+
+
+@app.post("/api/integrations/indmoney/write")
+def indmoney_write_rejected():
+    return jsonify({"error": "INDmoney MCP is read-only; trading and account mutations are unsupported", "live_writes": False}), 405
 
 
 @app.get("/api/strategies")
