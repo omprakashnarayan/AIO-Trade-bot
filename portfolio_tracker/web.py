@@ -13,6 +13,7 @@ from flask import Flask, jsonify, redirect, render_template_string, request, ses
 from werkzeug.security import check_password_hash
 
 from .config import DEFAULT_SETTINGS, load_settings, save_settings
+from .agents import AGENTS, list_agents, retry_agent, run_agent
 from .db import Database
 from .execution import ExecutionGateway, LiveModeRejected
 from .reporting import generate_report
@@ -135,7 +136,7 @@ action_template = """
 <body>
 <div class="shell">
   <header class="topbar"><div class="brand"><div class="mark">⌁</div><div>PORTFOLIO <span class="muted">// NOC</span></div></div><div class="top-actions"><span class="pill live">● LOCAL / PAPER MODE</span><a class="button" href="{{ url_for('refresh') }}">↻ Refresh snapshot</a><a href="{{ url_for('api_report') }}">JSON report ↗</a><form method="post" action="{{ url_for('logout') }}" style="display:inline"><button class="small">Logout</button></form></div></header>
-  <nav class="actions" aria-label="Operator navigation"><a class="button small" href="{{ url_for('index') }}">Portfolio</a><a class="button small" href="{{ url_for('operator_page', section='trades') }}">Trades</a><a class="button small" href="{{ url_for('operator_page', section='integrations') }}">Integrations</a><a class="button small" href="{{ url_for('operator_page', section='strategies') }}">Strategies</a><a class="button small" href="{{ url_for('operator_page', section='scheduler') }}">Scheduler</a><a class="button small" href="{{ url_for('operator_page', section='audit') }}">Audit / Risk</a><a class="button small" href="{{ url_for('operator_page', section='settings') }}">Settings</a></nav>
+  <nav class="actions" aria-label="Operator navigation"><a class="button small" href="{{ url_for('index') }}">Portfolio</a><a class="button small" href="{{ url_for('operator_page', section='agents') }}">Agents</a><a class="button small" href="{{ url_for('operator_page', section='trades') }}">Trades</a><a class="button small" href="{{ url_for('operator_page', section='integrations') }}">Integrations</a><a class="button small" href="{{ url_for('operator_page', section='strategies') }}">Strategies</a><a class="button small" href="{{ url_for('operator_page', section='scheduler') }}">Scheduler</a><a class="button small" href="{{ url_for('operator_page', section='audit') }}">Audit / Risk</a><a class="button small" href="{{ url_for('operator_page', section='settings') }}">Settings</a></nav>
   <section class="hero"><div class="hero-copy"><div class="eyebrow">Homelab portfolio operations console</div><h1>Signal over noise.</h1><p class="muted">A local-first command center for holdings, price snapshots, and disciplined paper-trading workflows.</p></div><div class="eyebrow">Last scan: {{ snapshot_time }}</div></section>
 
   <section class="grid">
@@ -379,9 +380,11 @@ OPERATOR_PAGE_TEMPLATE = """
 <style>
 :root{color-scheme:dark;--bg:#080d14;--panel:#0e1723;--line:#203247;--text:#dce8f4;--muted:#8498ad;--cyan:#43d9ff;--green:#5ee6a8;--amber:#f5c66d;--red:#ff7184}*{box-sizing:border-box}body{font:14px system-ui;background:var(--bg);color:var(--text);margin:0}.shell{max-width:1280px;margin:auto;padding:26px}.top{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap}.brand{font-weight:800;letter-spacing:.12em}.muted{color:var(--muted)}a{color:var(--cyan);text-decoration:none}.nav{display:flex;gap:8px;flex-wrap:wrap;margin:22px 0}.nav a,.button,button{border:1px solid #2b6277;border-radius:8px;background:#123344;color:#dff8ff;padding:9px 12px;cursor:pointer;font-weight:700}.nav a.active{background:#1b536b}.button.danger,button.danger{background:#321a25;border-color:#6b3040;color:#ffb4bd}.card{border:1px solid var(--line);background:var(--panel);border-radius:14px;padding:18px;margin:14px 0}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:14px}.span-6{grid-column:span 6}.span-12{grid-column:span 12}.card h2{margin-top:0}.form-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}label{display:grid;gap:5px;color:var(--muted);font-size:12px}input,select,textarea{width:100%;border:1px solid var(--line);border-radius:8px;background:#09121d;color:var(--text);padding:10px}table{width:100%;border-collapse:collapse}th,td{text-align:left;border-bottom:1px solid #1b2a3c;padding:9px 7px;vertical-align:top}.table-wrap{overflow:auto}.status{margin-top:14px;padding:10px;border-left:3px solid var(--cyan);background:#0a2430;white-space:pre-wrap}.status.error{border-color:var(--red);background:#2a151c}.pill{font-size:11px;color:var(--green);border:1px solid #2c7257;border-radius:99px;padding:4px 8px}.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}@media(max-width:800px){.span-6{grid-column:span 12}.form-grid{grid-template-columns:1fr}}
 </style></head><body><div class="shell"><div class="top"><div class="brand">PORTFOLIO // NOC</div><span class="pill">LOCAL / PAPER MODE</span></div>
-<nav class="nav">{% for name,label in [('','Portfolio'),('trades','Trades'),('integrations','Integrations'),('strategies','Strategies'),('scheduler','Scheduler'),('audit','Audit / Risk'),('settings','Settings')] %}<a class="{{ 'active' if section == name else '' }}" href="{{ '/' if not name else '/page/' + name }}">{{ label }}</a>{% endfor %}<a href="/">← Dashboard</a></nav>
+<nav class="nav">{% for name,label in [('','Portfolio'),('agents','Agents'),('trades','Trades'),('integrations','Integrations'),('strategies','Strategies'),('scheduler','Scheduler'),('audit','Audit / Risk'),('settings','Settings')] %}<a class="{{ 'active' if section == name else '' }}" href="{{ '/' if not name else '/page/' + name }}">{{ label }}</a>{% endfor %}<a href="/">← Dashboard</a></nav>
 <div class="card"><h1>{{ section|title }}</h1><p class="muted">{{ description }}</p></div>
-{% if section == 'trades' %}
+{% if section == 'agents' %}
+<div class="card"><h2>Local agent control plane</h2><p class="muted">All agent behavior is controlled here. Runs are bounded, durable, paper-first, and never execute shell commands or live broker writes.</p></div><div class="grid">{% for agent in data.agents %}<div class="card span-6"><h2>{{ agent.name }}</h2><p class="muted">{{ agent.description }}</p><p>Mode: <strong>{{ agent.mode }}</strong> · Enabled: <strong>{{ 'yes' if agent.enabled else 'no' }}</strong></p><p>Last run: <strong>{{ agent.last_run_status or 'never' }}</strong>{% if agent.last_run_started_at %} at {{ agent.last_run_started_at }}{% endif %}</p><div class="actions"><button onclick="agentAction('{{ agent.name }}','toggle',{{ 'false' if agent.enabled else 'true' }})">{{ 'Disable' if agent.enabled else 'Enable' }}</button><button onclick="agentAction('{{ agent.name }}','run',false)">Run now</button><button onclick="agentAction('{{ agent.name }}','test',true)">Run test / dry-run</button><button onclick="agentAction('{{ agent.name }}','retry',false)">Retry last run</button><button onclick="agentLogs('{{ agent.name }}')">View logs</button></div></div>{% endfor %}</div><div id="result" class="status">Select an action. Validation and failures are shown here.</div>
+{% elif section == 'trades' %}
 <div class="grid"><div class="card span-6"><h2>Place paper order</h2><form id="paper-order" class="form-grid"><label>Symbol<input name="symbol" placeholder="INFY" required></label><label>Side<select name="side"><option>buy</option><option>sell</option></select></label><label>Quantity<input name="quantity" type="number" step="0.0001" required></label><label>Quote price<input name="quote_price" type="number" step="0.01" required></label><label>Currency<input name="currency" value="INR"></label><label>Account ID<input name="account_id" value="operator"></label><label>Portfolio ID<input name="portfolio_id" value="Main"></label><label>Idempotency key<input name="idempotency_key" required></label><div class="actions"><button>Submit paper order</button><button type="button" class="danger" onclick="postJson('/api/risk/kill-switch',{state:'on'})">Enable kill switch</button></div></form><div id="result" class="status">Ready.</div></div><div class="card span-6"><h2>Order history</h2><div class="table-wrap"><table><tr><th>ID</th><th>Symbol</th><th>Side</th><th>Status</th><th>Mode</th></tr>{% for o in data.orders %}<tr><td>{{ o.id }}</td><td>{{ o.symbol if o.symbol is defined else o.order_payload }}</td><td>{{ o.side if o.side is defined else '' }}</td><td>{{ o.status }}</td><td>{{ o.mode }}</td></tr>{% else %}<tr><td colspan="5" class="muted">No orders yet.</td></tr>{% endfor %}</table></div></div></div>
 {% elif section == 'integrations' %}
 <div class="grid">{% for name,status in data.items() %}<div class="card span-6"><h2>{{ name|upper }}</h2><p class="muted">{{ status.status }}</p><p>Configured: <strong>{{ 'yes' if status.configured else 'no' }}</strong> · Live writes: <strong>{{ 'yes' if status.live_writes else 'no' }}</strong> · Read-only: <strong>{{ 'yes' if status.read_only else 'no' }}</strong></p><button onclick="syncIntegration('{{ name }}')">Check / sync {{ name|upper }}</button></div>{% endfor %}</div><div id="result" class="status">No provider call has been made.</div>
@@ -397,6 +400,8 @@ OPERATOR_PAGE_TEMPLATE = """
 </div><script>
 async function postJson(url,payload){const box=document.getElementById('result');try{const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const d=await r.json();box.textContent=JSON.stringify(d,null,2);box.className='status'+(r.ok?'':' error')}catch(e){box.textContent=e;box.className='status error'}}
 async function syncIntegration(name){await postJson('/api/integrations/'+name+'/sync',{})}
+async function agentAction(name,action,test){const body=action==='toggle'?{enabled:test}:{test:test};const url=action==='toggle'?'/api/agents/'+name:'/api/agents/'+name+'/'+(action==='retry'?'retry':'run');await postJson(url,body)}
+async function agentLogs(name){const box=document.getElementById('result');try{const r=await fetch('/api/agents/'+name+'/runs');const d=await r.json();box.textContent=JSON.stringify(d,null,2);box.className='status'+(r.ok?'':' error')}catch(e){box.textContent=e;box.className='status error'}}
 document.getElementById('paper-order')?.addEventListener('submit',async e=>{e.preventDefault();const p=Object.fromEntries(new FormData(e.target));await postJson('/api/orders/paper',p)})
 document.getElementById('strategy-form')?.addEventListener('submit',async e=>{e.preventDefault();const p=Object.fromEntries(new FormData(e.target));p.as_of=new Date().toISOString();p.now=p.as_of;await postJson('/api/strategies/proposals',p)})
 </script></body></html>
@@ -405,16 +410,17 @@ document.getElementById('strategy-form')?.addEventListener('submit',async e=>{e.
 
 @app.get("/page/<section>")
 def operator_page(section: str):
-    if section not in {"trades", "integrations", "strategies", "scheduler", "audit", "settings"}:
+    if section not in {"trades", "agents", "integrations", "strategies", "scheduler", "audit", "settings"}:
         return jsonify({"error": "unknown operator page"}), 404
     db = Database(); db.init_db()
     if section == "trades": data = {"orders": _json_rows(db.list_order_intents()), "transactions": _json_rows(db.list_transactions())}
+    elif section == "agents": data = {"agents": list_agents(db)}
     elif section == "integrations": data = _integration_status()
     elif section == "scheduler": data = _scheduler_snapshot(db)
     elif section == "audit": data = {"kill_switch": db.get_console_state("global_kill_switch", "off"), "events": _json_rows(db.list_audit_events(limit=100)), "approvals": _json_rows(db.list_live_approvals())}
     elif section == "settings": data = load_settings()
     else: data = {"paper_only": True, "supported": ["kite-short-term/v1", "upstox-long-term/v1", "indmoney-us-read-only/v1"], "note": "Strategies accept caller-supplied facts only and never submit orders."}
-    descriptions = {"trades": "Paper orders use the execution gateway; manual transactions remain local ledger records.", "integrations": "Provider connectors are reported honestly from configuration only; no network calls are made.", "strategies": "Generate expiring proposals from supplied facts; proposals do not execute.", "scheduler": "Durable scheduler state and run outcomes.", "audit": "Append-only events, risk posture, kill switch, and live approval records.", "settings": "Local operator preferences and deployment posture."}
+    descriptions = {"agents": "Enable, disable, test, run, retry, and inspect durable local agents.", "trades": "Paper orders use the execution gateway; manual transactions remain local ledger records.", "integrations": "Provider connectors are reported honestly from configuration only; no network calls are made.", "strategies": "Generate expiring proposals from supplied facts; proposals do not execute.", "scheduler": "Durable scheduler state and run outcomes.", "audit": "Append-only events, risk posture, kill switch, and live approval records.", "settings": "Local operator preferences and deployment posture."}
     return render_template_string(OPERATOR_PAGE_TEMPLATE, section=section, description=descriptions[section], data=data)
 
 
@@ -427,6 +433,56 @@ def _scheduler_snapshot(db: Database):
         state = _json_rows(conn.execute("SELECT * FROM scheduler_state ORDER BY trigger_id").fetchall())
         runs = _json_rows(conn.execute("SELECT * FROM scheduler_runs ORDER BY created_at DESC LIMIT 100").fetchall())
     return {"enabled": bool(load_settings().get("scheduler_enabled", False)), "state": state, "runs": runs}
+
+
+@app.get("/api/agents")
+def api_agents():
+    db = Database(); db.init_db()
+    return jsonify({"agents": list_agents(db), "paper_only": True})
+
+
+@app.route("/api/agents/<name>", methods=["PUT", "PATCH"])
+def api_agent_state(name: str):
+    payload = _payload()
+    db = Database(); db.init_db()
+    if db.get_agent(name) is None: return jsonify({"error": "unknown agent"}), 404
+    if not isinstance(payload.get("enabled"), bool): return jsonify({"error": "enabled must be a boolean"}), 400
+    db.set_agent_enabled(name, payload["enabled"])
+    return jsonify(next(item for item in list_agents(db) if item["name"] == name))
+
+
+@app.post("/api/agents/<name>/run")
+def api_agent_run(name: str):
+    payload = _payload(); db = Database(); db.init_db()
+    if any(key in payload and not isinstance(payload[key], bool) for key in ("test", "dry_run")): return jsonify({"error": "test and dry_run must be booleans"}), 400
+    try: result = run_agent(db, name, run_type="test" if payload.get("test", payload.get("dry_run", False)) else "run")
+    except KeyError: return jsonify({"error": "unknown agent"}), 404
+    except PermissionError as exc: return jsonify({"error": str(exc), "code": "agent_disabled"}), 409
+    return jsonify(result), 200 if result["status"] == "succeeded" else 500
+
+
+@app.post("/api/agents/<name>/retry")
+def api_agent_retry(name: str):
+    db = Database(); db.init_db()
+    try: result = retry_agent(db, name)
+    except KeyError: return jsonify({"error": "unknown agent"}), 404
+    except (PermissionError, ValueError) as exc: return jsonify({"error": str(exc)}), 409
+    return jsonify(result), 200 if result["status"] == "succeeded" else 500
+
+
+@app.get("/api/agents/<name>/runs")
+def api_agent_runs(name: str):
+    db = Database(); db.init_db()
+    if db.get_agent(name) is None: return jsonify({"error": "unknown agent"}), 404
+    return jsonify({"agent": name, "runs": db.list_agent_runs(name, min(int(request.args.get("limit", 50)), 100))})
+
+
+@app.get("/api/agents/<name>/runs/<int:run_id>")
+def api_agent_run_detail(name: str, run_id: int):
+    db = Database(); db.init_db(); result = db.get_agent_run(run_id)
+    if db.get_agent(name) is None: return jsonify({"error": "unknown agent"}), 404
+    if result is None or result["agent_name"] != name: return jsonify({"error": "run not found"}), 404
+    return jsonify(result)
 
 
 @app.get("/api/portfolio")

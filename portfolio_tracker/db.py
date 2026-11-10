@@ -107,6 +107,17 @@ CREATE TABLE IF NOT EXISTS live_approvals (
 CREATE TABLE IF NOT EXISTS console_state (
     key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS agents (
+    name TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+    mode TEXT NOT NULL, description TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS agent_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, agent_name TEXT NOT NULL REFERENCES agents(name),
+    run_type TEXT NOT NULL CHECK (run_type IN ('run','test')), status TEXT NOT NULL CHECK (status IN ('running','succeeded','failed')),
+    started_at TEXT NOT NULL, finished_at TEXT, retry_of INTEGER, result_json TEXT NOT NULL DEFAULT '{}',
+    log TEXT NOT NULL DEFAULT '', FOREIGN KEY (retry_of) REFERENCES agent_runs(id)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_agent_started ON agent_runs(agent_name, started_at DESC);
 """
 
 
@@ -448,6 +459,10 @@ class Database:
             _migrate_paper_holdings(conn)
             _migrate_paper_transactions(conn)
             _ensure_supporting_objects(conn)
+            from .agents import AGENTS
+            now = datetime.now(timezone.utc).isoformat()
+            for agent in AGENTS:
+                conn.execute("INSERT OR IGNORE INTO agents(name, enabled, mode, description, updated_at) VALUES (?, 1, ?, ?, ?)", (agent["name"], agent["mode"], agent["description"], now))
             conn.execute("PRAGMA foreign_keys = ON")
 
     def insert_order_intent(self, intent: Any, *, broker_id: str = "paper", status: str = "pending", external_order_id: str | None = None) -> int:
@@ -776,6 +791,51 @@ class Database:
         now = datetime.now(timezone.utc).isoformat()
         with self.connect() as conn:
             conn.execute("INSERT INTO console_state(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at", (key, value, now))
+
+    def list_agents(self) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute("SELECT a.*, r.id AS last_run_id, r.run_type AS last_run_type, r.status AS last_run_status, r.started_at AS last_run_started_at, r.finished_at AS last_run_finished_at FROM agents a LEFT JOIN agent_runs r ON r.id=(SELECT id FROM agent_runs WHERE agent_name=a.name ORDER BY id DESC LIMIT 1) ORDER BY a.name").fetchall()
+
+    def get_agent(self, name: str) -> sqlite3.Row | None:
+        with self.connect() as conn:
+            return conn.execute("SELECT * FROM agents WHERE name=?", (name,)).fetchone()
+
+    def set_agent_enabled(self, name: str, enabled: bool) -> bool:
+        with self.connect() as conn:
+            cur = conn.execute("UPDATE agents SET enabled=?, updated_at=? WHERE name=?", (1 if enabled else 0, datetime.now(timezone.utc).isoformat(), name))
+            return cur.rowcount == 1
+
+    def create_agent_run(self, agent_name: str, *, run_type: str, started_at: str, retry_of: int | None = None) -> int:
+        if run_type not in {"run", "test"}:
+            raise ValueError("run_type must be run or test")
+        with self.connect() as conn:
+            cur = conn.execute("INSERT INTO agent_runs(agent_name, run_type, status, started_at, retry_of) VALUES (?, ?, 'running', ?, ?)", (agent_name, run_type, started_at, retry_of))
+            return int(cur.lastrowid)
+
+    def finish_agent_run(self, run_id: int, *, status: str, finished_at: str, result: Any, log: str) -> None:
+        if status not in {"succeeded", "failed"}:
+            raise ValueError("invalid agent run status")
+        with self.connect() as conn:
+            conn.execute("UPDATE agent_runs SET status=?, finished_at=?, result_json=?, log=? WHERE id=?", (status, finished_at, _canonical_json(result, "agent result"), log, run_id))
+
+    def get_agent_run(self, run_id: int) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM agent_runs WHERE id=?", (run_id,)).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        try: result["result"] = json.loads(result.pop("result_json"))
+        except json.JSONDecodeError: result["result"] = {"error": "invalid stored result"}
+        return result
+
+    def get_last_agent_run(self, name: str) -> sqlite3.Row | None:
+        with self.connect() as conn:
+            return conn.execute("SELECT * FROM agent_runs WHERE agent_name=? ORDER BY id DESC LIMIT 1", (name,)).fetchone()
+
+    def list_agent_runs(self, name: str, limit: int = 50) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute("SELECT id FROM agent_runs WHERE agent_name=? ORDER BY id DESC LIMIT ?", (name, limit)).fetchall()
+        return [result for row in rows if (result := self.get_agent_run(int(row["id"]))) is not None]
 
     def get_price_cache(self, portfolio: str, symbol: str) -> sqlite3.Row | None:
         with self.connect() as conn: return conn.execute("SELECT * FROM price_cache WHERE portfolio=? AND symbol=?", (portfolio, symbol.upper())).fetchone()
