@@ -48,6 +48,36 @@ def test_live_order_and_approval_never_execute(tmp_path, monkeypatch):
     assert decided.get_json()["execution"] == "still disabled"
 
 
+def test_terminal_workspace_renders_functional_panels_and_safe_controls(tmp_path, monkeypatch):
+    db = Database(tmp_path / "console.sqlite3")
+    client = auth_client(monkeypatch, db)
+    db.init_db()
+    db.upsert_holding(symbol="INFY", shares=2, avg_cost=100, portfolio="Main", currency="INR")
+    response = client.get("/")
+    assert response.status_code == 200
+    html = response.get_data(as_text=True)
+    for marker in ("OM//TERMINAL", "HOLDINGS BLOTTER", "RISK MONITOR", "AGENT MONITOR", "INTEGRATIONS", "COMMANDS", "PAPER ONLY"):
+        assert marker in html
+    assert "INFY" in html
+    assert "UNAVAILABLE" in html
+    assert "X-CSRF-Token" in html
+    assert "setTimeout(poll,30000)" in html
+
+
+def test_console_snapshot_is_authenticated_and_bounded(tmp_path, monkeypatch):
+    db = Database(tmp_path / "console.sqlite3")
+    monkeypatch.setattr(web, "Database", lambda: db)
+    monkeypatch.setenv("PORTFOLIO_ADMIN_USERNAME", "admin")
+    monkeypatch.setenv("PORTFOLIO_ADMIN_PASSWORD_HASH", generate_password_hash("secret"))
+    client = web.app.test_client()
+    assert client.get("/api/console/snapshot").status_code == 401
+    client.post("/login", data={"username": "admin", "password": "secret"})
+    payload = client.get("/api/console/snapshot").get_json()
+    assert {"generated_at", "summary", "risk", "agents", "integrations", "audit_events"} <= payload.keys()
+    assert len(payload["audit_events"]) <= 25
+    assert payload["risk"]["live_writes"] is False
+
+
 def test_strategy_and_integration_surfaces_are_local(tmp_path, monkeypatch):
     client = auth_client(monkeypatch, Database(tmp_path / "console.sqlite3"))
     now = datetime.now(timezone.utc).isoformat()
