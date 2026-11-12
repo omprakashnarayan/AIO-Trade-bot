@@ -64,6 +64,27 @@ def test_terminal_workspace_renders_functional_panels_and_safe_controls(tmp_path
     assert "setTimeout(poll,30000)" in html
 
 
+def test_every_operator_workspace_uses_terminal_shell_and_controls(tmp_path, monkeypatch):
+    client = auth_client(monkeypatch, Database(tmp_path / "console.sqlite3"))
+    expected = {
+        "agents": ("AGENT CONTROL PLANE", "Run now"),
+        "trades": ("PAPER ORDER TICKET", "Submit paper order"),
+        "integrations": ("INTEGRATIONS", "Refresh status"),
+        "strategies": ("PROPOSAL TICKET", "Generate paper proposal"),
+        "scheduler": ("SCHEDULER CONTROL", "Run due proposals"),
+        "audit": ("RISK CONTROL", "AUDIT EVENT STREAM"),
+        "settings": ("OPERATOR SETTINGS", "Save settings"),
+    }
+    for section, markers in expected.items():
+        response = client.get(f"/page/{section}")
+        assert response.status_code == 200, section
+        html = response.get_data(as_text=True)
+        for marker in ("OM//TERMINAL", "WORKSPACES", "⌘K COMMANDS", "PAPER ONLY", "polling bounded", *markers):
+            assert marker in html, (section, marker)
+        assert "<table" in html or "<form" in html or "button" in html
+        assert "JSON.stringify" in html  # action results remain readable in the status panel
+
+
 def test_console_snapshot_is_authenticated_and_bounded(tmp_path, monkeypatch):
     db = Database(tmp_path / "console.sqlite3")
     monkeypatch.setattr(web, "Database", lambda: db)

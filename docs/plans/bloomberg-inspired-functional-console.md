@@ -2,7 +2,7 @@
 
 > **For Hermes:** Use subagent-driven-development skill to implement this plan task-by-task.
 
-**Goal:** Replace the current card-based landing page with a dense, functional terminal workspace while preserving the existing validated APIs and paper-first safety boundary.
+**Goal:** Make every operator page a dense, functional terminal workspace while preserving the existing validated APIs and paper-first safety boundary.
 
 **Architecture:** Keep Flask routes and backend models. Add a terminal shell to `web.py` with real server-rendered portfolio data, JSON-backed panel actions, keyboard command palette, auto-refresh, and links to existing operator pages. Add focused tests for rendered controls, commands, and safe actions.
 
