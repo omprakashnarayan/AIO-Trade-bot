@@ -212,6 +212,34 @@ CREATE TABLE IF NOT EXISTS benchmark_snapshots (
     UNIQUE(benchmark, source, as_of)
 );
 CREATE INDEX IF NOT EXISTS idx_benchmark_time ON benchmark_snapshots(benchmark, as_of DESC);
+CREATE TABLE IF NOT EXISTS research_evidence (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, source_identifier TEXT NOT NULL,
+    captured_at TEXT NOT NULL, provider TEXT NOT NULL, excerpt TEXT NOT NULL DEFAULT '', content_hash TEXT NOT NULL,
+    symbol TEXT NOT NULL DEFAULT '', topic TEXT NOT NULL DEFAULT '', verified INTEGER NOT NULL DEFAULT 1 CHECK (verified IN (0,1)),
+    created_at TEXT NOT NULL, UNIQUE(source, source_identifier, content_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_research_evidence_scope ON research_evidence(symbol, topic, captured_at DESC);
+CREATE TABLE IF NOT EXISTS research_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT NOT NULL, status TEXT NOT NULL,
+    provider TEXT NOT NULL, model_version TEXT NOT NULL, strategy_version TEXT NOT NULL,
+    started_at TEXT NOT NULL, finished_at TEXT NOT NULL, input_json TEXT NOT NULL DEFAULT '{}',
+    result_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_research_runs_topic ON research_runs(topic, id DESC);
+CREATE TABLE IF NOT EXISTS research_findings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL REFERENCES research_runs(id),
+    finding_type TEXT NOT NULL, symbol TEXT NOT NULL DEFAULT '', statement TEXT NOT NULL,
+    confidence TEXT NOT NULL, risks_json TEXT NOT NULL DEFAULT '[]', invalidation_json TEXT NOT NULL DEFAULT '[]',
+    evidence_ids_json TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'proposed',
+    model_version TEXT NOT NULL, strategy_version TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_research_findings_run ON research_findings(run_id, id);
+CREATE TABLE IF NOT EXISTS research_feedback (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, finding_id INTEGER NOT NULL REFERENCES research_findings(id),
+    action TEXT NOT NULL CHECK(action IN ('accepted','dismissed','corrected')), correction TEXT NOT NULL DEFAULT '',
+    user_id TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_research_feedback_finding ON research_feedback(finding_id, id DESC);
 """
 
 
@@ -1062,6 +1090,64 @@ class Database:
         with self.connect() as conn:
             rows = conn.execute("SELECT id FROM agent_runs WHERE agent_name=? ORDER BY id DESC LIMIT ?", (name, limit)).fetchall()
         return [result for row in rows if (result := self.get_agent_run(int(row["id"]))) is not None]
+
+    def create_research_evidence(self, *, source: str, source_identifier: str, captured_at: str, provider: str, excerpt: str = "", content_hash: str, symbol: str = "", topic: str = "", verified: bool = True) -> int:
+        now = datetime.now(timezone.utc).isoformat()
+        with self.connect() as conn:
+            cur = conn.execute("INSERT INTO research_evidence(source,source_identifier,captured_at,provider,excerpt,content_hash,symbol,topic,verified,created_at) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(source,source_identifier,content_hash) DO UPDATE SET captured_at=excluded.captured_at,provider=excluded.provider,excerpt=excluded.excerpt,symbol=excluded.symbol,topic=excluded.topic,verified=excluded.verified", (source, source_identifier, captured_at, provider, excerpt, content_hash, symbol.upper(), topic, 1 if verified else 0, now))
+            row = conn.execute("SELECT id FROM research_evidence WHERE source=? AND source_identifier=? AND content_hash=?", (source, source_identifier, content_hash)).fetchone()
+            return int(row["id"])
+
+    def list_research_evidence(self, *, symbol: str | None = None, topic: str | None = None, limit: int = 100) -> list[sqlite3.Row]:
+        clauses, params = [], []
+        if symbol is not None: clauses.append("symbol=?"); params.append(symbol.upper())
+        if topic is not None: clauses.append("topic=?"); params.append(topic)
+        params.append(min(max(int(limit), 1), 500))
+        with self.connect() as conn: return conn.execute("SELECT * FROM research_evidence" + (" WHERE " + " AND ".join(clauses) if clauses else "") + " ORDER BY captured_at DESC,id DESC LIMIT ?", params).fetchall()
+
+    def create_research_run(self, *, topic: str, status: str, provider: str, model_version: str, strategy_version: str, started_at: str, finished_at: str, inputs: Any, result: Any) -> int:
+        with self.connect() as conn:
+            cur = conn.execute("INSERT INTO research_runs(topic,status,provider,model_version,strategy_version,started_at,finished_at,input_json,result_json) VALUES(?,?,?,?,?,?,?,?,?)", (topic, status, provider, model_version, strategy_version, started_at, finished_at, _canonical_json(inputs, "research inputs"), _canonical_json(result, "research result")))
+            return int(cur.lastrowid)
+
+    def create_research_finding(self, *, run_id: int, finding_type: str, symbol: str = "", statement: str, confidence: str, risks: Any, invalidation: Any, evidence_ids: Any, model_version: str, strategy_version: str, status: str = "proposed") -> int:
+        with self.connect() as conn:
+            cur = conn.execute("INSERT INTO research_findings(run_id,finding_type,symbol,statement,confidence,risks_json,invalidation_json,evidence_ids_json,status,model_version,strategy_version,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (run_id, finding_type, symbol.upper(), statement, confidence, _canonical_json(risks, "risks"), _canonical_json(invalidation, "invalidation"), _canonical_json(evidence_ids, "evidence ids"), status, model_version, strategy_version, datetime.now(timezone.utc).isoformat()))
+            return int(cur.lastrowid)
+
+    @staticmethod
+    def _research_row(row: sqlite3.Row) -> dict[str, Any]:
+        result = dict(row)
+        for key in ("risks_json", "invalidation_json", "evidence_ids_json", "input_json", "result_json"):
+            if key in result:
+                try: result[key.removesuffix("_json")] = json.loads(result.pop(key))
+                except json.JSONDecodeError: result[key.removesuffix("_json")] = [] if key.endswith("ids_json") or key == "risks_json" or key == "invalidation_json" else {}
+        return result
+
+    def list_research_runs(self, *, topic: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute("SELECT * FROM research_runs" + (" WHERE topic=?" if topic else "") + " ORDER BY id DESC LIMIT ?", ((topic,) if topic else ()) + (min(max(int(limit), 1), 100),)).fetchall()
+        return [self._research_row(row) for row in rows]
+
+    def list_research_findings(self, *, run_id: int | None = None, status: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        clauses, params = [], []
+        if run_id is not None: clauses.append("run_id=?"); params.append(run_id)
+        if status is not None: clauses.append("status=?"); params.append(status)
+        params.append(min(max(int(limit), 1), 500))
+        with self.connect() as conn: rows = conn.execute("SELECT * FROM research_findings" + (" WHERE " + " AND ".join(clauses) if clauses else "") + " ORDER BY id DESC LIMIT ?", params).fetchall()
+        return [self._research_row(row) for row in rows]
+
+    def add_research_feedback(self, *, finding_id: int, action: str, user_id: str, correction: str = "") -> int:
+        if action not in {"accepted", "dismissed", "corrected"}: raise ValueError("invalid feedback action")
+        now = datetime.now(timezone.utc).isoformat()
+        with self.connect() as conn:
+            if conn.execute("SELECT id FROM research_findings WHERE id=?", (finding_id,)).fetchone() is None: raise ValueError("finding not found")
+            cur = conn.execute("INSERT INTO research_feedback(finding_id,action,correction,user_id,created_at) VALUES(?,?,?,?,?)", (finding_id, action, correction, user_id, now))
+            conn.execute("UPDATE research_findings SET status=? WHERE id=?", (action, finding_id))
+            return int(cur.lastrowid)
+
+    def list_research_feedback(self, finding_id: int | None = None, limit: int = 100) -> list[sqlite3.Row]:
+        with self.connect() as conn: return conn.execute("SELECT * FROM research_feedback" + (" WHERE finding_id=?" if finding_id is not None else "") + " ORDER BY id DESC LIMIT ?", ((finding_id,) if finding_id is not None else ()) + (min(max(int(limit), 1), 500),)).fetchall()
 
     def get_price_cache(self, portfolio: str, symbol: str) -> sqlite3.Row | None:
         with self.connect() as conn: return conn.execute("SELECT * FROM price_cache WHERE portfolio=? AND symbol=?", (portfolio, symbol.upper())).fetchone()

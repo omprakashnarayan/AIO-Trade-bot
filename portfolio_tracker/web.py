@@ -25,6 +25,7 @@ from .provider_data import ProviderSyncService
 from .ledger import FinancialEvent, calculate, export_data, import_rows
 from .market_data import MarketDataService, BenchmarkSnapshot, _now
 from .analytics import portfolio_analytics
+from .research import add_evidence, run_research, portfolio_health, concentration_risk, placeholder
 from .brokers.kite import KiteAdapter, KiteConfig
 from .brokers.upstox import UpstoxAdapter, UpstoxConfig
 
@@ -460,7 +461,7 @@ def api_portfolio_analytics():
 
 @app.get("/page/<section>")
 def operator_page(section: str):
-    if section not in {"trades", "ledger", "analytics", "agents", "integrations", "strategies", "scheduler", "audit", "settings"}:
+    if section not in {"trades", "ledger", "analytics", "agents", "research", "integrations", "strategies", "scheduler", "audit", "settings"}:
         return jsonify({"error": "unknown operator page"}), 404
     db = Database(); db.init_db()
     if section == "trades": data = {"orders": _json_rows(db.list_order_intents()), "transactions": _json_rows(db.list_transactions())}
@@ -475,12 +476,13 @@ def operator_page(section: str):
         data = {"filters": filters, "events": events, "lots": summary["lots"], "summary": summary, "export_json": "/api/ledger/export?format=json" + suffix, "export_csv": "/api/ledger/export?format=csv" + suffix}
     elif section == "analytics": data = {"status": "authenticated", "note": "verified/manual prices only"}
     elif section == "agents": data = {"agents": list_agents(db)}
+    elif section == "research": data = {"runs": db.list_research_runs(), "findings": db.list_research_findings(), "evidence": _json_rows(db.list_research_evidence())}
     elif section == "integrations": data = _integration_status()
     elif section == "scheduler": data = _scheduler_snapshot(db)
     elif section == "audit": data = {"kill_switch": db.get_console_state("global_kill_switch", "off"), "events": _json_rows(db.list_audit_events(limit=100)), "approvals": _json_rows(db.list_live_approvals())}
     elif section == "settings": data = load_settings()
     else: data = {"paper_only": True, "supported": ["kite-short-term/v1", "upstox-long-term/v1", "indmoney-us-read-only/v1"], "note": "Strategies accept caller-supplied facts only and never submit orders."}
-    descriptions = {"analytics": "Quote freshness, portfolio value, P/L, drawdown, concentration, and benchmark comparison from verified or manual snapshots.", "agents": "Enable, disable, test, run, retry, and inspect durable local agents.", "trades": "Paper orders use the execution gateway; manual transactions remain local ledger records.", "ledger": "Import, reconcile, inspect FIFO cost basis, and export tax-ready ledger data.", "integrations": "Provider connectors are reported honestly from configuration only; no network calls are made.", "strategies": "Generate expiring proposals from supplied facts; proposals do not execute.", "scheduler": "Durable scheduler state and run outcomes.", "audit": "Append-only events, risk posture, kill switch, and live approval records.", "settings": "Local operator preferences and deployment posture."}
+    descriptions = {"analytics": "Quote freshness, portfolio value, P/L, drawdown, concentration, and benchmark comparison from verified or manual snapshots.", "agents": "Enable, disable, test, run, retry, and inspect durable local agents.", "research": "Evidence, bounded findings, feedback, and paper-only decision support.", "trades": "Paper orders use the execution gateway; manual transactions remain local ledger records.", "ledger": "Import, reconcile, inspect FIFO cost basis, and export tax-ready ledger data.", "integrations": "Provider connectors are reported honestly from configuration only; no network calls are made.", "strategies": "Generate expiring proposals from supplied facts; proposals do not execute.", "scheduler": "Durable scheduler state and run outcomes.", "audit": "Append-only events, risk posture, kill switch, and live approval records.", "settings": "Local operator preferences and deployment posture."}
     return render_template_string(OPERATOR_PAGE_TEMPLATE, section=section, description=descriptions[section], data=data)
 
 
@@ -511,7 +513,7 @@ def api_agent_state(name: str):
 def api_agent_run(name: str):
     payload = _payload(); db = Database(); db.init_db()
     if any(key in payload and not isinstance(payload[key], bool) for key in ("test", "dry_run")): return jsonify({"error": "test and dry_run must be booleans"}), 400
-    try: result = run_agent(db, name, run_type="test" if payload.get("test", payload.get("dry_run", False)) else "run")
+    try: result = run_agent(db, name, run_type="test" if payload.get("test", payload.get("dry_run", False)) else "run", payload=payload)
     except KeyError: return jsonify({"error": "unknown agent"}), 404
     except PermissionError as exc: return jsonify({"error": str(exc), "code": "agent_disabled"}), 409
     return jsonify(result), 200 if result["status"] == "succeeded" else 500
@@ -545,6 +547,80 @@ def api_agent_run_detail(name: str, run_id: int):
 def api_portfolio():
     snapshot, _, path = generate_report(Database(), save=True)
     return jsonify({"snapshot": snapshot, "report_path": str(path)})
+
+
+@app.post("/api/research/evidence")
+def api_research_evidence_create():
+    try:
+        db = Database(); db.init_db(); evidence_id = add_evidence(db, _payload())
+        return jsonify({"id": evidence_id, "evidence": _json_rows(db.list_research_evidence(limit=1))[0]}), 201
+    except (TypeError, ValueError, KeyError) as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.get("/api/research/evidence")
+def api_research_evidence_list():
+    db = Database(); db.init_db()
+    rows = db.list_research_evidence(symbol=request.args.get("symbol"), topic=request.args.get("topic"), limit=int(request.args.get("limit", 100)))
+    return jsonify({"evidence": _json_rows(rows)})
+
+
+@app.post("/api/research/run")
+def api_research_run():
+    payload = _payload()
+    if not isinstance(payload.get("facts", []), list): return jsonify({"error": "facts must be an array"}), 400
+    try:
+        db = Database(); db.init_db()
+        result = run_research(db, topic=str(payload.get("topic", "market")), facts=payload.get("facts", []), max_age_seconds=int(payload.get("max_age_seconds", 86400)))
+        return jsonify(result), 200
+    except (TypeError, ValueError, KeyError) as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.get("/api/research/runs")
+def api_research_runs():
+    db = Database(); db.init_db(); return jsonify({"runs": db.list_research_runs(topic=request.args.get("topic"), limit=int(request.args.get("limit", 50)))})
+
+
+@app.get("/api/research/findings")
+def api_research_findings():
+    db = Database(); db.init_db(); return jsonify({"findings": db.list_research_findings(run_id=int(request.args["run_id"]) if request.args.get("run_id") else None, status=request.args.get("status"), limit=int(request.args.get("limit", 100)))})
+
+
+@app.post("/api/research/findings/<int:finding_id>/feedback")
+def api_research_feedback(finding_id: int):
+    payload = _payload()
+    try:
+        db = Database(); db.init_db(); feedback_id = db.add_research_feedback(finding_id=finding_id, action=str(payload["action"]), correction=str(payload.get("correction", "")), user_id=str(session.get("operator", "operator")))
+        return jsonify({"id": feedback_id, "finding_id": finding_id, "action": payload["action"]}), 201
+    except (TypeError, ValueError, KeyError) as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.post("/api/research/findings/<int:finding_id>/paper-proposal")
+def api_research_paper_proposal(finding_id: int):
+    db = Database(); db.init_db(); findings = [item for item in db.list_research_findings(limit=500) if int(item["id"]) == finding_id]
+    if not findings: return jsonify({"error": "finding not found"}), 404
+    finding = findings[0]
+    if finding["status"] != "accepted": return jsonify({"error": "finding must be accepted before paper proposal generation"}), 409
+    if not finding["evidence_ids"]: return jsonify({"error": "finding has no evidence"}), 409
+    return jsonify({"proposal_id": f"research-{finding_id}", "mode": "paper", "execution": "disabled", "symbol": finding["symbol"], "rationale": finding["statement"], "evidence_ids": finding["evidence_ids"], "risks": finding["risks"], "invalidation": finding["invalidation"], "strategy_version": finding["strategy_version"]}), 201
+
+
+@app.get("/api/research/portfolio-health")
+def api_research_health():
+    db = Database(); db.init_db(); return jsonify(portfolio_health(db, portfolio=request.args.get("portfolio")))
+
+
+@app.get("/api/research/concentration-risk")
+def api_research_concentration():
+    db = Database(); db.init_db(); return jsonify(concentration_risk(db, portfolio=request.args.get("portfolio")))
+
+
+@app.get("/api/research/<topic>")
+def api_research_placeholder(topic: str):
+    if topic not in {"rebalance-candidates", "earnings", "news"}: return jsonify({"error": "unknown research topic"}), 404
+    return jsonify(placeholder(topic))
 
 
 @app.get("/api/transactions")

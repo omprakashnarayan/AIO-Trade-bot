@@ -11,6 +11,7 @@ from .reporting import generate_report
 from .imports.indmoney import INDMONEY_US_PORTFOLIO, import_indmoney_csv, import_indmoney_records
 from .ledger import calculate, export_data, import_rows
 from .web import main as run_web
+from .research import add_evidence, run_research
 
 
 def cmd_init(_args):
@@ -114,6 +115,22 @@ def cmd_ledger_export(args):
     print(export_data(db, fmt=args.format, namespace=args.namespace))
 
 
+def cmd_research_evidence(args):
+    db = Database(); db.init_db()
+    payload = json.loads(Path(args.file).read_text(encoding="utf-8")) if args.file else {"source": args.source, "source_identifier": args.identifier, "captured_at": args.captured_at, "provider": args.provider, "excerpt": args.excerpt, "symbol": args.symbol, "topic": args.topic, "verified": True}
+    print(json.dumps({"id": add_evidence(db, payload)}, sort_keys=True))
+
+
+def cmd_research_run(args):
+    db = Database(); db.init_db(); facts = json.loads(Path(args.facts).read_text(encoding="utf-8")) if args.facts else []
+    print(json.dumps(run_research(db, topic=args.topic, facts=facts, max_age_seconds=args.max_age_seconds), sort_keys=True))
+
+
+def cmd_research_view(args):
+    db = Database(); db.init_db()
+    print(json.dumps({"runs": db.list_research_runs(topic=args.topic), "findings": db.list_research_findings(), "evidence": [dict(row) for row in db.list_research_evidence(topic=args.topic)]}, default=str, sort_keys=True))
+
+
 def cmd_serve(args):
     run_web(host=args.host, port=args.port, debug=args.debug)
 
@@ -169,6 +186,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--namespace", default="manual"); p.add_argument("--portfolio"); p.add_argument("--symbol"); p.set_defaults(func=cmd_ledger_report)
     p = sub.add_parser("ledger-export", help="export ledger events")
     p.add_argument("--namespace", default="manual"); p.add_argument("--format", choices=["csv","json"], default="json"); p.set_defaults(func=cmd_ledger_export)
+
+    p = sub.add_parser("research-evidence", help="record verified research evidence")
+    p.add_argument("--file", help="JSON evidence object")
+    p.add_argument("--source", default="manual"); p.add_argument("--identifier", default=""); p.add_argument("--captured-at", dest="captured_at", default=""); p.add_argument("--provider", default="manual"); p.add_argument("--excerpt", default=""); p.add_argument("--symbol", default=""); p.add_argument("--topic", default="")
+    p.set_defaults(func=cmd_research_evidence)
+    p = sub.add_parser("research-run", help="run evidence-gated research dry-run")
+    p.add_argument("topic"); p.add_argument("--facts", help="JSON array file"); p.add_argument("--max-age-seconds", type=int, default=86400); p.set_defaults(func=cmd_research_run)
+    p = sub.add_parser("research", help="view Research workspace data")
+    p.add_argument("--topic"); p.set_defaults(func=cmd_research_view)
 
     p = sub.add_parser("serve", help="run the local web app")
     p.add_argument("--host", default="127.0.0.1")

@@ -8,13 +8,14 @@ from typing import Any, Callable
 from .config import load_settings
 from .db import Database
 from .reporting import generate_report
+from .research import run_research, portfolio_health, concentration_risk, placeholder
 
 AGENTS: tuple[dict[str, str], ...] = (
     {"name": "market_research", "mode": "deterministic", "description": "Local market research boundary; no provider connector configured."},
     {"name": "kite_short_term_proposals", "mode": "paper-proposals", "description": "Produces no-trade paper proposal status from local facts only."},
     {"name": "upstox_long_term_proposals", "mode": "paper-proposals", "description": "Produces no-trade paper proposal status from local facts only."},
     {"name": "indmoney_us_import", "mode": "read-only", "description": "Reports the INDmoney import connector honestly without network calls."},
-    {"name": "risk_review", "mode": "deterministic", "description": "Reviews local risk settings and kill-switch posture."},
+    {"name": "risk_review", "mode": "deterministic", "description": "Reviews local risk settings and deterministic portfolio concentration."},
     {"name": "paper_trading", "mode": "paper-only", "description": "Reports paper broker readiness; never submits live orders."},
     {"name": "scheduler", "mode": "paper-only", "description": "Runs the local scheduler boundary without external strategy calls."},
 )
@@ -24,16 +25,22 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _handler(name: str, db: Database, *, test: bool) -> dict[str, Any]:
+def _handler(name: str, db: Database, *, test: bool, payload: dict[str, Any] | None = None) -> dict[str, Any]:
     settings = load_settings()
     if name == "market_research":
-        return {"status": "unconfigured_connector", "message": "No market data connector is configured; no external call was made.", "facts": 0}
+        result = run_research(db, topic=str((payload or {}).get("topic", "market")), facts=(payload or {}).get("facts", []))
+        if result.get("status") == "unavailable":
+            result["research_status"] = result["status"]
+            result["status"] = "unconfigured_connector"
+        return result
     if name in {"kite_short_term_proposals", "upstox_long_term_proposals"}:
         return {"status": "no_trade", "message": "No caller-supplied market facts are queued; no proposal was generated.", "proposals": 0}
     if name == "indmoney_us_import":
         return {"status": "unconfigured_connector", "message": "INDmoney import is read-only and has no configured connector; no external call was made.", "imported": 0}
     if name == "risk_review":
-        return {"status": "ok", "paper_only": True, "live_writes": False, "kill_switch": db.get_console_state("global_kill_switch", "off"), "trading_mode": settings.get("trading_mode"), "max_order_notional": settings.get("max_order_notional"), "max_position_weight": settings.get("max_position_weight")}
+        return {"status": "ok", "paper_only": True, "live_writes": False, "kill_switch": db.get_console_state("global_kill_switch", "off"), "trading_mode": settings.get("trading_mode"), "max_order_notional": settings.get("max_order_notional"), "max_position_weight": settings.get("max_position_weight"), "concentration": concentration_risk(db)}
+    if name == "portfolio_health":
+        return portfolio_health(db)
     if name == "paper_trading":
         return {"status": "ready", "paper_only": True, "live_writes": False, "message": "Paper broker is available; this control-plane run submits no orders."}
     if name == "scheduler":
@@ -50,7 +57,7 @@ def list_agents(db: Database) -> list[dict[str, Any]]:
     return [dict(row) for row in db.list_agents()]
 
 
-def run_agent(db: Database, name: str, *, run_type: str = "run", retry_of: int | None = None) -> dict[str, Any]:
+def run_agent(db: Database, name: str, *, run_type: str = "run", retry_of: int | None = None, payload: dict[str, Any] | None = None) -> dict[str, Any]:
     if name not in {item["name"] for item in AGENTS}:
         raise KeyError(name)
     agent = db.get_agent(name)
@@ -61,7 +68,7 @@ def run_agent(db: Database, name: str, *, run_type: str = "run", retry_of: int |
     started = _now()
     run_id = db.create_agent_run(name, run_type=run_type, started_at=started, retry_of=retry_of)
     try:
-        result = _handler(name, db, test=run_type == "test")
+        result = _handler(name, db, test=run_type == "test", payload=payload)
         result["dry_run"] = run_type == "test"
         result["run_type"] = run_type
         finished = _now()
