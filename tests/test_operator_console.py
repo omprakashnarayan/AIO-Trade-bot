@@ -65,6 +65,15 @@ def test_terminal_workspace_renders_functional_panels_and_safe_controls(tmp_path
     assert "setTimeout(poll,30000)" in html
 
 
+def test_dashboard_rejects_legacy_horizontal_operator_navigation(tmp_path, monkeypatch):
+    client = auth_client(monkeypatch, Database(tmp_path / "console.sqlite3"))
+    response = client.get("/")
+    assert response.status_code == 200
+    html = response.get_data(as_text=True)
+    assert '<main class="layout"><nav class="nav"' in html
+    assert '<nav class="actions" aria-label="Operator navigation">' not in html
+
+
 def test_every_operator_workspace_uses_terminal_shell_and_controls(tmp_path, monkeypatch):
     client = auth_client(monkeypatch, Database(tmp_path / "console.sqlite3"))
     expected = {
