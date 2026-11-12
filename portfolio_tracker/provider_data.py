@@ -167,6 +167,12 @@ class ProviderSyncService:
             response = adapter.snapshot()
             snapshot = normalize_provider_snapshot(meta.provider_name, meta.broker_id, meta.account_id, response, source=meta.provider_name)
             counts = self.db.upsert_provider_snapshot(snapshot)
+            # Provider fills become broker-scoped ledger events only; paper state is never touched.
+            from .ledger import FinancialEvent, record_event
+            for fill in snapshot.fills:
+                side = str(fill.raw.get("side", "")).lower()
+                if side in {"buy", "sell"}:
+                    record_event(self.db, FinancialEvent(event_type=side, namespace="broker", broker_id=meta.broker_id, account_id=meta.account_id, portfolio=meta.account_id or meta.broker_id, symbol=fill.symbol, quantity=fill.quantity, price=fill.price, currency=fill.currency, event_date=(fill.filled_at or snapshot.captured_at), source=meta.provider_name, external_id=fill.provider_fill_id, source_timestamp=fill.filled_at, metadata=dict(fill.raw)))
             reconciliation = self.db.reconcile_provider_snapshot(snapshot)
             finished = now_utc()
             self.db.finish_provider_sync_run(run_id, status="succeeded", finished_at=finished, error=None, counts=counts, reconciliation_id=reconciliation["id"])

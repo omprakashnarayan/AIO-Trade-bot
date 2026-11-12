@@ -22,6 +22,7 @@ from .risk import RiskEngine, RiskLimits
 from .strategies import MarketFact, PortfolioFact, StrategyInputError, propose_kite_short_term, propose_upstox_long_term, propose_indmoney_us_tracking
 from .trading_models import ExecutionMode, OrderIntent, OrderSide, OrderType, TimeInForce
 from .provider_data import ProviderSyncService
+from .ledger import FinancialEvent, calculate, export_data, import_rows
 from .brokers.kite import KiteAdapter, KiteConfig
 from .brokers.upstox import UpstoxAdapter, UpstoxConfig
 
@@ -504,6 +505,47 @@ def api_create_transaction():
 def api_transaction_mutation(transaction_id: int):
     return jsonify({"error": "transactions are append-only; create/read only", "transaction_id": transaction_id}), 405
 
+
+@app.get("/api/ledger/events")
+def api_ledger_events():
+    db = Database(); db.init_db()
+    scope = {k: request.args.get(k) for k in ("namespace", "portfolio", "symbol", "broker_id", "account_id") if request.args.get(k) is not None}
+    return jsonify({"events": _json_rows(db.list_financial_events(**scope))})
+
+@app.post("/api/ledger/import/preview")
+@app.post("/api/ledger/import")
+def api_ledger_import():
+    payload = _payload(); rows = payload.get("rows")
+    if rows is None and request.files.get("file"):
+        import csv, io
+        rows = list(csv.DictReader(io.StringIO(request.files["file"].read().decode("utf-8"))))
+    if not isinstance(rows, list): return jsonify({"error": "rows must be an array"}), 400
+    db = Database(); db.init_db(); preview = request.path.endswith("/preview")
+    try: result = import_rows(db, rows, namespace=str(payload.get("namespace","manual")), source=str(payload.get("source","import")), preview=preview)
+    except (TypeError, ValueError) as exc: return jsonify({"error": str(exc)}), 400
+    if not preview: db.append_audit_event(event_type="ledger.import", entity_type="ledger_import", entity_id=str(result["accepted"]), payload=result, mode="paper")
+    return jsonify(result), 200 if preview else 201
+
+@app.get("/api/ledger/lots")
+def api_ledger_lots():
+    db = Database(); db.init_db()
+    try: result = calculate(db, namespace=request.args.get("namespace","manual"), portfolio=request.args.get("portfolio"), symbol=request.args.get("symbol"), as_of=request.args.get("as_of"))
+    except ValueError as exc: return jsonify({"error": str(exc)}), 400
+    return jsonify(result)
+
+@app.get("/api/ledger/realized")
+def api_ledger_realized():
+    return api_ledger_lots()
+
+@app.get("/api/ledger/income")
+def api_ledger_income():
+    db = Database(); db.init_db(); result=calculate(db, namespace=request.args.get("namespace","manual"), portfolio=request.args.get("portfolio"), as_of=request.args.get("as_of"))
+    return jsonify({"income": result["income"], "fees": result["fees"], "taxes": result["taxes"]})
+
+@app.get("/api/ledger/export")
+def api_ledger_export():
+    db = Database(); db.init_db(); fmt=request.args.get("format","json"); scope={k:request.args.get(k) for k in ("namespace","portfolio","symbol") if request.args.get(k) is not None}
+    body=export_data(db, fmt=fmt, **scope); return (body, 200, {"Content-Type": "text/csv" if fmt == "csv" else "application/json"})
 
 @app.get("/api/orders")
 def api_list_orders():

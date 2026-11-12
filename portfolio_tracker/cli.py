@@ -9,6 +9,7 @@ from .config import load_settings, save_settings
 from .db import Database
 from .reporting import generate_report
 from .imports.indmoney import INDMONEY_US_PORTFOLIO, import_indmoney_csv, import_indmoney_records
+from .ledger import calculate, export_data, import_rows
 from .web import main as run_web
 
 
@@ -96,6 +97,23 @@ def cmd_import_indmoney(args):
     print(json.dumps({"portfolio": result.portfolio, "imported": result.imported, "skipped": result.skipped}, sort_keys=True))
 
 
+def cmd_ledger_import(args):
+    db = Database(); db.init_db()
+    raw = Path(args.file).read_text(encoding="utf-8")
+    rows = list(__import__("csv").DictReader(raw.splitlines())) if args.file.endswith(".csv") else json.loads(raw)
+    print(json.dumps(import_rows(db, rows, namespace=args.namespace, source=args.source, preview=args.preview), sort_keys=True))
+
+
+def cmd_ledger_report(args):
+    db = Database(); db.init_db()
+    print(json.dumps(calculate(db, namespace=args.namespace, portfolio=args.portfolio, symbol=args.symbol), sort_keys=True))
+
+
+def cmd_ledger_export(args):
+    db = Database(); db.init_db()
+    print(export_data(db, fmt=args.format, namespace=args.namespace))
+
+
 def cmd_serve(args):
     run_web(host=args.host, port=args.port, debug=args.debug)
 
@@ -144,6 +162,13 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("list", help="list holdings").set_defaults(func=cmd_list)
     sub.add_parser("refresh", help="fetch prices and save report").set_defaults(func=cmd_refresh)
     sub.add_parser("report", help="print a markdown report").set_defaults(func=cmd_report)
+
+    p = sub.add_parser("ledger-import", help="preview/import normalized financial events")
+    p.add_argument("file"); p.add_argument("--namespace", choices=["manual","broker","indmoney","paper"], default="manual"); p.add_argument("--source", default="cli"); p.add_argument("--preview", action="store_true"); p.set_defaults(func=cmd_ledger_import)
+    p = sub.add_parser("ledger-report", help="calculate FIFO lots and P/L")
+    p.add_argument("--namespace", default="manual"); p.add_argument("--portfolio"); p.add_argument("--symbol"); p.set_defaults(func=cmd_ledger_report)
+    p = sub.add_parser("ledger-export", help="export ledger events")
+    p.add_argument("--namespace", default="manual"); p.add_argument("--format", choices=["csv","json"], default="json"); p.set_defaults(func=cmd_ledger_export)
 
     p = sub.add_parser("serve", help="run the local web app")
     p.add_argument("--host", default="127.0.0.1")

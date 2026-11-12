@@ -159,6 +159,35 @@ CREATE TABLE IF NOT EXISTS agent_runs (
     log TEXT NOT NULL DEFAULT '', FOREIGN KEY (retry_of) REFERENCES agent_runs(id)
 );
 CREATE INDEX IF NOT EXISTS idx_agent_runs_agent_started ON agent_runs(agent_name, started_at DESC);
+CREATE TABLE IF NOT EXISTS financial_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, namespace TEXT NOT NULL CHECK(namespace IN ('manual','broker','indmoney','paper')),
+    broker_id TEXT NOT NULL DEFAULT '', account_id TEXT NOT NULL DEFAULT '', portfolio_id TEXT NOT NULL DEFAULT '',
+    portfolio TEXT NOT NULL DEFAULT 'Main', symbol TEXT NOT NULL DEFAULT '', event_type TEXT NOT NULL,
+    quantity TEXT NOT NULL DEFAULT '0', price TEXT NOT NULL DEFAULT '0', gross_amount TEXT NOT NULL DEFAULT '0',
+    fees TEXT NOT NULL DEFAULT '0', taxes TEXT NOT NULL DEFAULT '0', currency TEXT NOT NULL,
+    fx_rate TEXT, fx_source TEXT, fx_as_of TEXT, event_date TEXT NOT NULL, source TEXT NOT NULL,
+    source_timestamp TEXT, external_id TEXT, metadata_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL,
+    UNIQUE(namespace, source, external_id)
+);
+CREATE INDEX IF NOT EXISTS idx_financial_events_scope ON financial_events(namespace, broker_id, account_id, portfolio, event_date, id);
+CREATE TABLE IF NOT EXISTS tax_lots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, event_id INTEGER NOT NULL REFERENCES financial_events(id),
+    namespace TEXT NOT NULL, broker_id TEXT NOT NULL DEFAULT '', account_id TEXT NOT NULL DEFAULT '', portfolio TEXT NOT NULL,
+    symbol TEXT NOT NULL, acquired_date TEXT NOT NULL, quantity TEXT NOT NULL, remaining_quantity TEXT NOT NULL,
+    unit_cost TEXT NOT NULL, currency TEXT NOT NULL, fx_rate TEXT, fx_source TEXT, fx_as_of TEXT, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tax_lots_scope ON tax_lots(namespace, broker_id, account_id, portfolio, symbol, acquired_date, id);
+CREATE TABLE IF NOT EXISTS lot_matches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, sell_event_id INTEGER NOT NULL REFERENCES financial_events(id),
+    lot_id INTEGER NOT NULL REFERENCES tax_lots(id), quantity TEXT NOT NULL, cost_basis TEXT NOT NULL,
+    proceeds TEXT NOT NULL, realized_pl TEXT NOT NULL, holding_days INTEGER NOT NULL, holding_period TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_lot_matches_sell ON lot_matches(sell_event_id);
+CREATE TABLE IF NOT EXISTS ledger_imports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, namespace TEXT NOT NULL, source TEXT NOT NULL,
+    imported_at TEXT NOT NULL, row_count INTEGER NOT NULL, accepted_count INTEGER NOT NULL, rejected_count INTEGER NOT NULL,
+    preview INTEGER NOT NULL DEFAULT 0, errors_json TEXT NOT NULL DEFAULT '[]'
+);
 """
 
 
@@ -708,6 +737,38 @@ class Database:
             conn.execute("INSERT INTO holdings(portfolio, symbol, label, currency, shares, avg_cost, notes, updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(portfolio, symbol) DO UPDATE SET label=excluded.label, currency=excluded.currency, shares=excluded.shares, avg_cost=excluded.avg_cost, notes=excluded.notes, updated_at=excluded.updated_at", (portfolio, symbol, row["label"] if row else "", currency, float(new_shares), float(new_avg), row["notes"] if row else notes, datetime.now(timezone.utc).isoformat()))
             conn.execute("INSERT INTO transactions(portfolio, symbol, side, shares, price, currency, fees, trade_date, notes) VALUES(?,?,?,?,?,?,?,?,?)", (portfolio, symbol, side, float(delta), float(price), currency, float(fee), trade_date or datetime.now(timezone.utc).date().isoformat(), notes))
             conn.commit()
+        from .ledger import FinancialEvent, record_event
+        record_event(self, FinancialEvent(event_type=side, namespace="manual", portfolio=portfolio, symbol=symbol, quantity=delta, price=price, fees=fee, currency=currency, event_date=trade_date or datetime.now(timezone.utc).date().isoformat(), source="legacy-manual"))
+    def record_financial_event(self, event: Any) -> int:
+        from .ledger import record_event
+        return record_event(self, event)
+
+    def list_financial_events(self, **scope: Any) -> list[sqlite3.Row]:
+        from .ledger import list_events
+        return list_events(self, **scope)
+
+    def calculate_cost_basis(self, **filters: Any) -> dict[str, Any]:
+        from .ledger import materialize_lots
+        return materialize_lots(self, **filters)
+
+    def import_financial_rows(self, rows: Any, **kwargs: Any) -> dict[str, Any]:
+        from .ledger import import_rows
+        return import_rows(self, rows, **kwargs)
+
+    def export_financial_data(self, **kwargs: Any) -> str:
+        from .ledger import export_data
+        return export_data(self, **kwargs)
+
+    def list_tax_lots(self, **scope: Any) -> list[sqlite3.Row]:
+        clauses, params = [], []
+        for key, value in scope.items():
+            if value is not None: clauses.append(key + "=?"); params.append(value)
+        with self.connect() as conn:
+            return conn.execute("SELECT * FROM tax_lots" + (" WHERE " + " AND ".join(clauses) if clauses else "") + " ORDER BY acquired_date,id", params).fetchall()
+
+    def list_lot_matches(self, sell_event_id: int | None = None) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute("SELECT * FROM lot_matches" + (" WHERE sell_event_id=?" if sell_event_id else "") + " ORDER BY id", (sell_event_id,) if sell_event_id else ()).fetchall()
 
     def get_paper_holding(self, *, broker_id: str = "paper", account_id: str | None = None, portfolio: str, symbol: str) -> sqlite3.Row | None:
         with self.connect() as conn:
