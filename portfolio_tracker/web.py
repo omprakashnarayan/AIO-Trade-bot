@@ -21,6 +21,9 @@ from .reporting import generate_report
 from .risk import RiskEngine, RiskLimits
 from .strategies import MarketFact, PortfolioFact, StrategyInputError, propose_kite_short_term, propose_upstox_long_term, propose_indmoney_us_tracking
 from .trading_models import ExecutionMode, OrderIntent, OrderSide, OrderType, TimeInForce
+from .provider_data import ProviderSyncService
+from .brokers.kite import KiteAdapter, KiteConfig
+from .brokers.upstox import UpstoxAdapter, UpstoxConfig
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("PORTFOLIO_SESSION_SECRET") or secrets.token_hex(32)
@@ -151,7 +154,28 @@ def _integration_secret_key() -> str:
 
 
 def _integration_status() -> dict[str, dict[str, Any]]:
-    return {name: integration_auth.status(_integration_secret_key(), name) for name in integration_auth.PROVIDERS}
+    result = {name: integration_auth.status(_integration_secret_key(), name) for name in integration_auth.PROVIDERS}
+    db = Database(); db.init_db()
+    for name, status in result.items():
+        record = integration_auth.get_provider(_integration_secret_key(), name)
+        account_id = str(record.get("account_id") or load_settings().get("default_account_id") or "operator")
+        runs = db.list_provider_sync_runs(broker_id=name, account_id=account_id, limit=1)
+        reconciliations = db.list_provider_reconciliations(broker_id=name, account_id=account_id, limit=1)
+        run = dict(runs[0]) if runs else None
+        rec = dict(reconciliations[0]) if reconciliations else None
+        status.update({"account_id": account_id, "source": (run or {}).get("provider"), "last_sync": (run or {}).get("finished_at"), "last_sync_status": (run or {}).get("status"), "last_sync_error": json.loads((run or {}).get("error_json", "{}")) if run else {}, "last_reconciliation": (rec or {}).get("created_at"), "reconciliation_status": (rec or {}).get("status")})
+    return result
+
+
+def _provider_adapter(name: str):
+    if name not in {"kite", "upstox"}:
+        raise ValueError("INDmoney remains an MCP/manual handoff and is not locally verified")
+    record = integration_auth.get_provider(_integration_secret_key(), name)
+    account_id = str(record.get("account_id") or load_settings().get("default_account_id") or "operator")
+    transport = app.config.get("PROVIDER_TRANSPORTS", {}).get(name)
+    if name == "kite":
+        return KiteAdapter(KiteConfig(account_id=account_id, api_key=str(record.get("api_key") or "configured"), access_token=record.get("access_token"), token_expires_at=datetime.fromisoformat(record["expires_at"]) if record.get("expires_at") else None), transport=transport)
+    return UpstoxAdapter(UpstoxConfig(account_id=account_id, client_id=str(record.get("client_id") or "configured"), access_token=record.get("access_token"), token_expires_at=datetime.fromisoformat(record["expires_at"]) if record.get("expires_at") else None), transport=transport)
 
 
 def _holding_values(payload: dict[str, Any], *, portfolio: str | None = None, symbol: str | None = None) -> dict[str, Any]:
@@ -368,7 +392,7 @@ OPERATOR_PAGE_TEMPLATE = r'''
 <aside class="panel right"><div class="panel-title">RISK MONITOR</div><div class="metric"><span>Kill switch</span><b class="{{ 'down' if risk.global_kill_switch else 'up' }}">{{ 'ON' if risk.global_kill_switch else 'OFF' }}</b></div><div class="metric"><span>Trading mode</span><b>{{ risk.trading_mode|upper }}</b></div><div class="metric"><span>Max order</span><b>{{ risk.max_order_notional or 'unset' }}</b></div><div class="metric"><span>Max position</span><b>{{ risk.max_position_weight or 'unset' }}</b></div><div class="panel-title">AGENT MONITOR</div>{% for agent in agents %}<div class="agent"><b>{{ agent.name }}</b><span class="badge">{{ agent.last_run_status or 'READY'|upper }}</span><br><span class="muted">{{ agent.mode }} · {{ agent.last_run_finished_at or 'never run' }}</span></div>{% else %}<div class="empty">No agents registered.</div>{% endfor %}<div class="panel-title">INTEGRATIONS</div>{% for name,status in integrations.items() %}<div class="metric"><span>{{ name|upper }}</span><b class="{{ 'up' if status.connected else 'warn' }}">{{ status.status|upper }}</b></div>{% endfor %}<div class="panel-title">ALERTS / POSTURE</div><div class="alert"><span class="up">●</span> {{ 'Kill switch engaged; paper orders blocked.' if risk.global_kill_switch else 'Paper-only safety boundary active.' }}</div><div class="alert"><span class="warn">●</span> Live market connectivity is not claimed.</div></aside></div>{% else %}<div class="panel-title">{{ section|upper }} // WORKSPACE <span class="muted">· authenticated polling enabled</span></div><div class="card"><h1>{{ section|title }}</h1><p class="muted">{{ description }}</p><p class="stale">STATUS: LOCAL DATA · provider connectivity and marks are shown only when configured.</p></div>
 {% if section == 'agents' %}<div class="grid"><div class="card span-12"><h2>AGENT CONTROL PLANE</h2><p class="muted">Bounded durable runs; no shell execution or live broker writes.</p>{% for agent in data.agents %}<div class="panel"><div class="panel-title">{{ agent.name }} <span class="muted">{{ agent.mode }} · {{ agent.last_run_status or 'NEVER RUN' }}</span></div><div class="card"><p>{{ agent.description }}</p><p>Enabled: <b>{{ 'YES' if agent.enabled else 'NO' }}</b> · Last run: {{ agent.last_run_finished_at or 'never' }}</p><div class="actions"><button onclick="agentAction('{{ agent.name }}','toggle',{{ 'false' if agent.enabled else 'true' }})">{{ 'Disable' if agent.enabled else 'Enable' }}</button><button onclick="agentAction('{{ agent.name }}','run',false)">Run now</button><button onclick="agentAction('{{ agent.name }}','test',true)">Dry-run</button><button onclick="agentAction('{{ agent.name }}','retry',false)">Retry</button><button onclick="agentLogs('{{ agent.name }}')">View logs</button></div></div></div>{% else %}<p class="muted">No agents registered.</p>{% endfor %}</div></div><div id="result" class="status">Ready for an agent action.</div>
 {% elif section == 'trades' %}<div class="grid"><div class="card span-6"><h2>PAPER ORDER TICKET</h2><form id="paper-order" class="form-grid"><label>Symbol<input name="symbol" placeholder="INFY" required></label><label>Side<select name="side"><option>buy</option><option>sell</option></select></label><label>Quantity<input name="quantity" type="number" step="0.0001" required></label><label>Quote price<input name="quote_price" type="number" step="0.01" required></label><label>Currency<input name="currency" value="INR"></label><label>Account ID<input name="account_id" value="operator"></label><label>Portfolio ID<input name="portfolio_id" value="Main"></label><label>Idempotency key<input name="idempotency_key" required></label><div class="actions"><button>Submit paper order</button><button type="button" class="danger" data-action="kill-switch">Enable kill switch</button></div></form><div id="result" class="status">Paper gateway ready. Risk checks remain active.</div></div><div class="card span-6"><h2>ORDER HISTORY</h2><div class="table-wrap"><table><thead><tr><th>ID</th><th>PAYLOAD</th><th>STATUS</th><th>MODE</th></tr></thead><tbody>{% for o in data.orders %}<tr><td>{{ o.id }}</td><td>{{ o.symbol if o.symbol is defined else o.order_payload }}</td><td>{{ o.status }}</td><td>{{ o.mode }}</td></tr>{% else %}<tr><td colspan="4" class="muted">No orders yet.</td></tr>{% endfor %}</tbody></table></div></div></div>
-{% elif section == 'integrations' %}<div class="grid">{% for name,status in data.items() %}<div class="card span-6"><h2>{{ name|upper }} <span class="{{ 'up' if status.connected else 'warn' }}">● {{ status.status|upper }}</span></h2><p class="muted">Configured: {{ 'yes' if status.configured else 'no' }} · Connected: {{ 'yes' if status.connected else 'no' }} · Last authorized: {{ status.last_authorized_at or 'never' }} · Expires: {{ status.expires_at or 'n/a' }}</p><p>Capabilities: read={{ 'yes' if status.capabilities.read else 'no' }}, reconciliation={{ 'yes' if status.capabilities.reconciliation else 'no' }}, trading=no. Live writes disabled.</p>{% if name == 'indmoney' %}<a class="button" href="{{ url_for('indmoney_connect') }}">Official MCP handoff</a>{% else %}<form method="post" action="{{ url_for('integration_config', name=name) }}" class="form-grid"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% if name == 'kite' %}<label>API key<input name="api_key" autocomplete="off"></label><label>API secret<input name="api_secret" type="password" autocomplete="new-password"></label>{% else %}<label>Client ID<input name="client_id" autocomplete="off"></label><label>Client secret<input name="client_secret" type="password" autocomplete="new-password"></label>{% endif %}<label>Redirect URL<input name="redirect_uri" type="url" required value="{{ status.redirect_uri or '' }}"></label><button>Save encrypted config</button></form><div class="actions"><form method="post" action="{{ url_for('integration_start', name=name) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button>Start OAuth</button></form><button type="button" onclick="syncIntegration('{{ name }}')">Refresh status</button></div>{% endif %}<div class="status">{{ 'CONNECTED' if status.connected else 'UNCONFIGURED / STALE' }} · no provider claim beyond saved local status.</div></div>{% endfor %}</div><div id="result" class="status">Integration actions report here.</div>
+{% elif section == 'integrations' %}<div class="grid">{% for name,status in data.items() %}<div class="card span-6"><h2>{{ name|upper }} <span class="{{ 'up' if status.connected else 'warn' }}">● {{ status.status|upper }}</span></h2><p class="muted">Source: {{ status.source or 'none' }} · Account: {{ status.account_id }} · Last sync: {{ status.last_sync or 'never' }} · Sync state: {{ status.last_sync_status or 'never' }} · Reconciliation: {{ status.reconciliation_status or 'never' }}{% if status.last_sync_error %} · Error: {{ status.last_sync_error.message or status.last_sync_error.code }}{% endif %}</p><p>Capabilities: read={{ 'yes' if status.capabilities.read else 'no' }}, reconciliation={{ 'yes' if status.capabilities.reconciliation else 'no' }}, trading=no. Live writes disabled.</p>{% if name == 'indmoney' %}<a class="button" href="{{ url_for('indmoney_connect') }}">Official MCP handoff</a>{% else %}<form method="post" action="{{ url_for('integration_config', name=name) }}" class="form-grid"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% if name == 'kite' %}<label>API key<input name="api_key" autocomplete="off"></label><label>API secret<input name="api_secret" type="password" autocomplete="new-password"></label>{% else %}<label>Client ID<input name="client_id" autocomplete="off"></label><label>Client secret<input name="client_secret" type="password" autocomplete="new-password"></label>{% endif %}<label>Redirect URL<input name="redirect_uri" type="url" required value="{{ status.redirect_uri or '' }}"></label><button>Save encrypted config</button></form><div class="actions"><form method="post" action="{{ url_for('integration_start', name=name) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button>Start OAuth</button></form><button type="button" onclick="syncIntegration('{{ name }}')">Refresh status</button></div>{% endif %}<div class="status">{{ 'CONNECTED' if status.connected else 'UNCONFIGURED / STALE' }} · no provider claim beyond saved local status.</div></div>{% endfor %}</div><div id="result" class="status">Integration actions report here.</div>
 {% elif section == 'strategies' %}<div class="card"><h2>PROPOSAL TICKET</h2><form id="strategy-form" class="form-grid"><label>Strategy<select name="strategy"><option>kite-short-term/v1</option><option>upstox-long-term/v1</option><option>indmoney-us-read-only/v1</option></select></label><label>Symbol<input name="symbol" value="INFY" required></label><label>Market<input name="market" value="INDIA"></label><label>Currency<input name="currency" value="INR"></label><label>Price<input name="price" type="number" step="0.01" required></label><label>Signal<select name="signal"><option>buy</option><option>sell</option><option>hold</option></select></label><label>Quantity<input name="quantity" value="1"></label><label>Source ID<input name="source_id" value="operator-input"></label><div class="actions"><button>Generate paper proposal</button></div></form><div id="result" class="status">Proposals are suggestions only and never execute.</div></div>
 {% elif section == 'scheduler' %}<div class="grid"><div class="card span-6"><h2>SCHEDULER CONTROL</h2><p>Enabled: <b>{{ 'YES' if data.enabled else 'NO' }}</b></p><div class="actions"><button onclick="postJson('/api/scheduler/state',{enabled:'true'})">Enable</button><button onclick="postJson('/api/scheduler/state',{enabled:'false'})">Disable</button><button onclick="postJson('/api/scheduler/run',{})">Run due proposals</button></div><div id="result" class="status">Scheduler is paper/proposal-only.</div></div><div class="card span-6"><h2>RECENT RUNS</h2><div class="table-wrap"><table><thead><tr><th>TIME</th><th>STATUS</th><th>DETAIL</th></tr></thead><tbody>{% for run in data.runs %}<tr><td>{{ run.created_at }}</td><td>{{ run.status }}</td><td>{{ run.message if run.message is defined else run }}</td></tr>{% else %}<tr><td colspan="3" class="muted">No scheduler runs.</td></tr>{% endfor %}</tbody></table></div></div></div>
 {% elif section == 'audit' %}<div class="grid"><div class="card span-6"><h2>RISK CONTROL</h2><p>Kill switch: <b>{{ data.kill_switch|upper }}</b></p><div class="actions"><button class="danger" onclick="postJson('/api/risk/kill-switch',{state:'on'})">Turn ON</button><button onclick="postJson('/api/risk/kill-switch',{state:'off'})">Turn OFF</button></div><div id="result" class="status">Risk actions are audited and paper-only.</div></div><div class="card span-6"><h2>LIVE APPROVALS</h2><p class="muted">Approval records never execute live orders.</p>{% for a in data.approvals %}<p>{{ a.id }} · {{ a.status }} · {{ a.proposal_id }}</p>{% else %}<p class="muted">No approval records.</p>{% endfor %}</div><div class="card span-12"><h2>AUDIT EVENT STREAM</h2><div class="table-wrap"><table><thead><tr><th>TIME</th><th>EVENT</th><th>ENTITY</th><th>MODE</th></tr></thead><tbody>{% for e in data.events %}<tr><td>{{ e.created_at }}</td><td>{{ e.event_type }}</td><td>{{ e.entity_type }} {{ e.entity_id }}</td><td>{{ e.mode }}</td></tr>{% else %}<tr><td colspan="4" class="muted">No audit events.</td></tr>{% endfor %}</tbody></table></div></div></div>
@@ -589,9 +613,37 @@ def indmoney_connect():
 
 @app.post("/api/integrations/<name>/sync")
 def api_integration_sync(name: str):
-    status = _integration_status().get(name)
-    if status is None: return jsonify({"error": "unknown integration"}), 404
-    return jsonify({"integration": name, "status": status["status"], "message": "Provider calls are limited to explicit browser OAuth callbacks; live writes are disabled."})
+    if name not in integration_auth.PROVIDERS:
+        return jsonify({"error": "unknown integration"}), 404
+    if not _csrf_ok():
+        return jsonify({"error": "CSRF validation failed"}), 403
+    if name == "indmoney":
+        return jsonify({"integration": name, "status": "unconfigured", "error": {"code": "mcp_handoff_required", "message": "INDmoney read-only MCP handoff is not locally verified", "retryable": False}}), 409
+    try:
+        db = Database(); db.init_db(); result = ProviderSyncService(db).sync(_provider_adapter(name))
+        return jsonify({"integration": name, **result}), 200 if result["status"] == "succeeded" else 502
+    except (KeyError, ValueError, RuntimeError) as exc:
+        return jsonify({"integration": name, "status": "error", "error": {"code": "connector_unconfigured", "message": str(exc), "retryable": False}}), 409
+
+
+@app.get("/api/integrations/<name>/sync")
+def api_integration_sync_status(name: str):
+    if name not in integration_auth.PROVIDERS: return jsonify({"error": "unknown integration"}), 404
+    record = integration_auth.get_provider(_integration_secret_key(), name)
+    account_id = str(record.get("account_id") or load_settings().get("default_account_id") or "operator")
+    db = Database(); db.init_db()
+    runs = _json_rows(db.list_provider_sync_runs(broker_id=name, account_id=account_id))
+    reconciliations = _json_rows(db.list_provider_reconciliations(broker_id=name, account_id=account_id))
+    return jsonify({"integration": name, "account_id": account_id, "status": _integration_status()[name], "runs": runs, "reconciliations": reconciliations, "live_writes": False})
+
+
+@app.get("/api/integrations/<name>/snapshot")
+def api_integration_snapshot(name: str):
+    if name not in {"kite", "upstox"}: return jsonify({"error": "INDmoney requires an MCP handoff and has no verified local snapshot"}), 409
+    record = integration_auth.get_provider(_integration_secret_key(), name)
+    account_id = str(record.get("account_id") or load_settings().get("default_account_id") or "operator")
+    db = Database(); db.init_db()
+    return jsonify({"integration": name, "account_id": account_id, "holdings": _json_rows(db.list_provider_holdings(broker_id=name, account_id=account_id)), "cash": _json_rows(db.list_provider_cash(broker_id=name, account_id=account_id)), "orders": _json_rows(db.list_provider_orders(broker_id=name, account_id=account_id)), "fills": _json_rows(db.list_provider_fills(broker_id=name, account_id=account_id))})
 
 
 @app.post("/api/integrations/indmoney/write")

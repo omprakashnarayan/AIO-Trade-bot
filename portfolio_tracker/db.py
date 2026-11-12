@@ -70,6 +70,47 @@ CREATE TABLE IF NOT EXISTS cash_balances (
     currency TEXT NOT NULL, balance TEXT NOT NULL CHECK (length(balance) > 0), updated_at TEXT NOT NULL,
     UNIQUE(broker_id, account_id, portfolio_id, currency), CHECK (account_id <> '' OR portfolio_id <> '')
 );
+CREATE TABLE IF NOT EXISTS provider_holdings (
+    broker_id TEXT NOT NULL, account_id TEXT NOT NULL, provider TEXT NOT NULL, source TEXT NOT NULL,
+    symbol TEXT NOT NULL, provider_id TEXT NOT NULL DEFAULT '', quantity TEXT NOT NULL, average_price TEXT,
+    currency TEXT NOT NULL, exchange TEXT NOT NULL DEFAULT '', captured_at TEXT NOT NULL, synced_at TEXT NOT NULL,
+    PRIMARY KEY (broker_id, account_id, symbol)
+);
+CREATE TABLE IF NOT EXISTS provider_positions (
+    broker_id TEXT NOT NULL, account_id TEXT NOT NULL, provider TEXT NOT NULL, source TEXT NOT NULL,
+    symbol TEXT NOT NULL, provider_id TEXT NOT NULL DEFAULT '', quantity TEXT NOT NULL, average_price TEXT,
+    currency TEXT NOT NULL, exchange TEXT NOT NULL DEFAULT '', captured_at TEXT NOT NULL, synced_at TEXT NOT NULL,
+    PRIMARY KEY (broker_id, account_id, symbol)
+);
+CREATE TABLE IF NOT EXISTS provider_cash (
+    broker_id TEXT NOT NULL, account_id TEXT NOT NULL, provider TEXT NOT NULL, source TEXT NOT NULL,
+    currency TEXT NOT NULL, balance TEXT NOT NULL, buying_power TEXT, captured_at TEXT NOT NULL, synced_at TEXT NOT NULL,
+    PRIMARY KEY (broker_id, account_id, currency)
+);
+CREATE TABLE IF NOT EXISTS provider_orders (
+    broker_id TEXT NOT NULL, account_id TEXT NOT NULL, provider TEXT NOT NULL, source TEXT NOT NULL,
+    provider_order_id TEXT NOT NULL, symbol TEXT NOT NULL, status TEXT NOT NULL, quantity TEXT NOT NULL,
+    filled_quantity TEXT NOT NULL, average_price TEXT, submitted_at TEXT, raw_payload TEXT NOT NULL,
+    captured_at TEXT NOT NULL, synced_at TEXT NOT NULL, PRIMARY KEY (broker_id, account_id, provider_order_id)
+);
+CREATE TABLE IF NOT EXISTS provider_fills (
+    broker_id TEXT NOT NULL, account_id TEXT NOT NULL, provider TEXT NOT NULL, source TEXT NOT NULL,
+    provider_fill_id TEXT NOT NULL, provider_order_id TEXT NOT NULL, symbol TEXT NOT NULL, quantity TEXT NOT NULL,
+    price TEXT NOT NULL, currency TEXT NOT NULL, filled_at TEXT, raw_payload TEXT NOT NULL,
+    captured_at TEXT NOT NULL, synced_at TEXT NOT NULL, PRIMARY KEY (broker_id, account_id, provider_fill_id)
+);
+CREATE TABLE IF NOT EXISTS provider_sync_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, broker_id TEXT NOT NULL, account_id TEXT NOT NULL, provider TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('running','succeeded','stale','error')), started_at TEXT NOT NULL,
+    finished_at TEXT, error_json TEXT NOT NULL DEFAULT '{}', counts_json TEXT NOT NULL DEFAULT '{}', reconciliation_id INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_provider_sync_scope ON provider_sync_runs(broker_id, account_id, id DESC);
+CREATE TABLE IF NOT EXISTS provider_reconciliations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, broker_id TEXT NOT NULL, account_id TEXT NOT NULL, provider TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('matched','mismatch','unavailable')), captured_at TEXT NOT NULL,
+    created_at TEXT NOT NULL, result_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_provider_reconcile_scope ON provider_reconciliations(broker_id, account_id, id DESC);
 CREATE TABLE IF NOT EXISTS audit_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT, event_type TEXT NOT NULL, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL,
     broker_id TEXT, account_id TEXT, portfolio_id TEXT, mode TEXT CHECK (mode IS NULL OR mode IN ('paper', 'live')),
@@ -747,6 +788,69 @@ class Database:
     @staticmethod
     def _append_audit_event_conn(conn: sqlite3.Connection, event_type: str, entity_type: str, entity_id: str, payload: Any, broker_id: str | None, account_id: str | None, portfolio_id: str | None, mode: str | None, occurred_at: str) -> None:
         conn.execute("INSERT INTO audit_events(event_type, entity_type, entity_id, broker_id, account_id, portfolio_id, mode, payload, occurred_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (event_type, entity_type, entity_id, broker_id, account_id, portfolio_id, mode, _canonical_json(payload, "audit payload"), occurred_at, occurred_at))
+
+    def create_provider_sync_run(self, broker_id: str, account_id: str, provider: str, *, started_at: str) -> int:
+        with self.connect() as conn:
+            cur = conn.execute("INSERT INTO provider_sync_runs(broker_id,account_id,provider,status,started_at) VALUES(?,?,?,?,?)", (broker_id, account_id, provider, "running", started_at))
+            return int(cur.lastrowid)
+
+    def finish_provider_sync_run(self, run_id: int, *, status: str, finished_at: str, error: Any = None, counts: Any = None, reconciliation_id: int | None = None) -> None:
+        if status not in {"succeeded", "stale", "error"}: raise ValueError("invalid provider sync status")
+        with self.connect() as conn:
+            conn.execute("UPDATE provider_sync_runs SET status=?, finished_at=?, error_json=?, counts_json=?, reconciliation_id=? WHERE id=?", (status, finished_at, _canonical_json(error or {}, "provider error"), _canonical_json(counts or {}, "provider counts"), reconciliation_id, run_id))
+
+    def upsert_provider_snapshot(self, snapshot: Any) -> dict[str, int]:
+        now = datetime.now(timezone.utc).isoformat(); counts = {"holdings": 0, "positions": 0, "cash": 0, "orders": 0, "fills": 0}
+        with self.connect() as conn:
+            for table, rows in (("provider_holdings", snapshot.holdings), ("provider_positions", snapshot.positions)):
+                for item in rows:
+                    conn.execute(f"INSERT INTO {table}(broker_id,account_id,provider,source,symbol,provider_id,quantity,average_price,currency,exchange,captured_at,synced_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(broker_id,account_id,symbol) DO UPDATE SET provider=excluded.provider,source=excluded.source,provider_id=excluded.provider_id,quantity=excluded.quantity,average_price=excluded.average_price,currency=excluded.currency,exchange=excluded.exchange,captured_at=excluded.captured_at,synced_at=excluded.synced_at", (snapshot.broker_id, snapshot.account_id, snapshot.provider, snapshot.source, item.symbol, item.provider_id, str(item.quantity), None if item.average_price is None else str(item.average_price), item.currency, item.exchange, snapshot.captured_at, now))
+                    counts["holdings" if table == "provider_holdings" else "positions"] += 1
+            for item in snapshot.cash:
+                conn.execute("INSERT INTO provider_cash(broker_id,account_id,provider,source,currency,balance,buying_power,captured_at,synced_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(broker_id,account_id,currency) DO UPDATE SET provider=excluded.provider,source=excluded.source,balance=excluded.balance,buying_power=excluded.buying_power,captured_at=excluded.captured_at,synced_at=excluded.synced_at", (snapshot.broker_id, snapshot.account_id, snapshot.provider, snapshot.source, item.currency, str(item.balance), None if item.buying_power is None else str(item.buying_power), snapshot.captured_at, now)); counts["cash"] += 1
+            for item in snapshot.orders:
+                conn.execute("INSERT INTO provider_orders(broker_id,account_id,provider,source,provider_order_id,symbol,status,quantity,filled_quantity,average_price,submitted_at,raw_payload,captured_at,synced_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(broker_id,account_id,provider_order_id) DO UPDATE SET status=excluded.status,quantity=excluded.quantity,filled_quantity=excluded.filled_quantity,average_price=excluded.average_price,submitted_at=excluded.submitted_at,raw_payload=excluded.raw_payload,captured_at=excluded.captured_at,synced_at=excluded.synced_at", (snapshot.broker_id, snapshot.account_id, snapshot.provider, snapshot.source, item.provider_order_id, item.symbol, item.status, str(item.quantity), str(item.filled_quantity), None if item.average_price is None else str(item.average_price), item.submitted_at, _canonical_json(item.raw, "provider order"), snapshot.captured_at, now)); counts["orders"] += 1
+            for item in snapshot.fills:
+                conn.execute("INSERT INTO provider_fills(broker_id,account_id,provider,source,provider_fill_id,provider_order_id,symbol,quantity,price,currency,filled_at,raw_payload,captured_at,synced_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(broker_id,account_id,provider_fill_id) DO UPDATE SET provider_order_id=excluded.provider_order_id,symbol=excluded.symbol,quantity=excluded.quantity,price=excluded.price,currency=excluded.currency,filled_at=excluded.filled_at,raw_payload=excluded.raw_payload,captured_at=excluded.captured_at,synced_at=excluded.synced_at", (snapshot.broker_id, snapshot.account_id, snapshot.provider, snapshot.source, item.provider_fill_id, item.provider_order_id, item.symbol, str(item.quantity), str(item.price), item.currency, item.filled_at, _canonical_json(item.raw, "provider fill"), snapshot.captured_at, now)); counts["fills"] += 1
+        return counts
+
+    def reconcile_provider_snapshot(self, snapshot: Any) -> dict[str, Any]:
+        """Compare the provider snapshot only with its own prior provider namespace."""
+        result = {"holding_count": len(snapshot.holdings), "position_count": len(snapshot.positions), "cash_count": len(snapshot.cash), "orders_count": len(snapshot.orders), "fills_count": len(snapshot.fills), "manual_or_paper_mutated": False}
+        status = "matched"
+        with self.connect() as conn:
+            cur = conn.execute("INSERT INTO provider_reconciliations(broker_id,account_id,provider,status,captured_at,created_at,result_json) VALUES(?,?,?,?,?,?,?)", (snapshot.broker_id, snapshot.account_id, snapshot.provider, status, snapshot.captured_at, datetime.now(timezone.utc).isoformat(), _canonical_json(result, "reconciliation result")))
+            result["id"] = int(cur.lastrowid); result["status"] = status
+        return result
+
+    def list_provider_sync_runs(self, *, broker_id: str | None = None, account_id: str | None = None, limit: int = 50) -> list[sqlite3.Row]:
+        clauses, params = [], []
+        if broker_id is not None: clauses.append("broker_id=?"); params.append(broker_id)
+        if account_id is not None: clauses.append("account_id=?"); params.append(account_id)
+        params.append(limit)
+        with self.connect() as conn: return conn.execute("SELECT * FROM provider_sync_runs" + (" WHERE " + " AND ".join(clauses) if clauses else "") + " ORDER BY id DESC LIMIT ?", params).fetchall()
+
+    def get_provider_reconciliation(self, reconciliation_id: int) -> sqlite3.Row | None:
+        with self.connect() as conn: return conn.execute("SELECT * FROM provider_reconciliations WHERE id=?", (reconciliation_id,)).fetchone()
+
+    def list_provider_reconciliations(self, *, broker_id: str | None = None, account_id: str | None = None, limit: int = 50) -> list[sqlite3.Row]:
+        clauses, params = [], []
+        if broker_id is not None: clauses.append("broker_id=?"); params.append(broker_id)
+        if account_id is not None: clauses.append("account_id=?"); params.append(account_id)
+        params.append(limit)
+        with self.connect() as conn: return conn.execute("SELECT * FROM provider_reconciliations" + (" WHERE " + " AND ".join(clauses) if clauses else "") + " ORDER BY id DESC LIMIT ?", params).fetchall()
+
+    def list_provider_holdings(self, *, broker_id: str, account_id: str) -> list[sqlite3.Row]:
+        with self.connect() as conn: return conn.execute("SELECT * FROM provider_holdings WHERE broker_id=? AND account_id=? ORDER BY symbol", (broker_id, account_id)).fetchall()
+
+    def list_provider_cash(self, *, broker_id: str, account_id: str) -> list[sqlite3.Row]:
+        with self.connect() as conn: return conn.execute("SELECT * FROM provider_cash WHERE broker_id=? AND account_id=? ORDER BY currency", (broker_id, account_id)).fetchall()
+
+    def list_provider_orders(self, *, broker_id: str, account_id: str) -> list[sqlite3.Row]:
+        with self.connect() as conn: return conn.execute("SELECT * FROM provider_orders WHERE broker_id=? AND account_id=? ORDER BY provider_order_id", (broker_id, account_id)).fetchall()
+
+    def list_provider_fills(self, *, broker_id: str, account_id: str) -> list[sqlite3.Row]:
+        with self.connect() as conn: return conn.execute("SELECT * FROM provider_fills WHERE broker_id=? AND account_id=? ORDER BY provider_fill_id", (broker_id, account_id)).fetchall()
 
     def list_holdings(self, portfolio: str | None = None) -> list[sqlite3.Row]:
         with self.connect() as conn: return conn.execute("SELECT * FROM holdings" + (" WHERE portfolio=?" if portfolio else "") + " ORDER BY portfolio, symbol", (portfolio,) if portfolio else ()).fetchall()

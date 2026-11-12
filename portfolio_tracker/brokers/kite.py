@@ -107,6 +107,19 @@ class KiteAdapter(ConfiguredAdapter):
         response = self._call("order_status", {"account_id": self._account_id, "order_id": order_id})
         return self._receipt(_mapping_data(response, self.provider_name), default_status="unknown")
 
+    def snapshot(self) -> Mapping[str, Any]:
+        """Read-only aggregate boundary; transport decides how provider/MCP calls are made."""
+        return self._call("snapshot", {"account_id": self._account_id})
+
+    def funds(self) -> Mapping[str, Any]:
+        return self._call("funds", {"account_id": self._account_id})
+
+    def orders(self) -> Mapping[str, Any]:
+        return self._call("orders", {"account_id": self._account_id})
+
+    def fills(self) -> Mapping[str, Any]:
+        return self._call("fills", {"account_id": self._account_id})
+
     def reconcile(self) -> ReconciliationReport:
         data = _mapping_data(self._call("reconcile", {"account_id": self._account_id}), self.provider_name)
         orders_data = data.get("orders", [])

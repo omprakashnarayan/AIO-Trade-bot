@@ -213,8 +213,8 @@ class ConfiguredAdapter:
         return self._live_enabled
 
     def _call(self, operation: str, payload: Mapping[str, Any], *, write: bool = False) -> Mapping[str, Any]:
+        self._assert_token_valid()
         if write:
-            self._assert_token_valid()
             raise LiveExecutionDisabled(self.provider_name)
         if self._transport is None:
             raise BrokerAdapterError("transport_unconfigured", "no injectable transport is configured", provider=self.provider_name)
