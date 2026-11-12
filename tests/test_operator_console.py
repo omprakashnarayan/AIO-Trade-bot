@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import re
 
 from werkzeug.security import generate_password_hash
 
@@ -75,14 +76,29 @@ def test_every_operator_workspace_uses_terminal_shell_and_controls(tmp_path, mon
         "audit": ("RISK CONTROL", "AUDIT EVENT STREAM"),
         "settings": ("OPERATOR SETTINGS", "Save settings"),
     }
-    for section, markers in expected.items():
-        response = client.get(f"/page/{section}")
-        assert response.status_code == 200, section
+    expected_nav = [("/", "Portfolio"), ("/page/trades", "Trades"), ("/page/agents", "Agents"), ("/page/integrations", "Integrations"), ("/page/strategies", "Strategies"), ("/page/scheduler", "Scheduler"), ("/page/audit", "Risk / Audit"), ("/page/settings", "Settings")]
+    pages = ["/"] + [f"/page/{section}" for section in expected]
+    shells = []
+    for path in pages:
+        response = client.get(path)
+        assert response.status_code == 200, path
         html = response.get_data(as_text=True)
-        for marker in ("OM//TERMINAL", "WORKSPACES", "⌘K COMMANDS", "PAPER ONLY", "polling bounded", *markers):
-            assert marker in html, (section, marker)
-        assert "<table" in html or "<form" in html or "button" in html
-        assert "JSON.stringify" in html  # action results remain readable in the status panel
+        nav = html.split('<nav class="nav"', 1)[1].split('</nav>', 1)[0]
+        actual_nav = [(href, label) for href, label in re.findall(r'<a href="([^"]+)"[^>]*>([^<]+)</a>', nav) if href.startswith("/") and label not in {"Run risk review"}]
+        assert actual_nav == expected_nav, path
+        assert "OM//TERMINAL" in html
+        assert "WORKSPACES" in html
+        assert "⌘K COMMANDS" in html
+        assert "PAPER ONLY" in html
+        if path != "/":
+            section = path.rsplit("/", 1)[-1]
+            for marker in expected[section]:
+                assert marker in html, (path, marker)
+        assert '<header class="topbar">' in html
+        assert '<main class="layout"><nav class="nav"' in html
+        assert '<section class="main">' in html
+        assert '<footer class="footer">' in html
+        assert '<nav class="actions"' not in html
 
 
 def test_console_snapshot_is_authenticated_and_bounded(tmp_path, monkeypatch):
