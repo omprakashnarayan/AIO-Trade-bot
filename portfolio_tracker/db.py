@@ -188,6 +188,30 @@ CREATE TABLE IF NOT EXISTS ledger_imports (
     imported_at TEXT NOT NULL, row_count INTEGER NOT NULL, accepted_count INTEGER NOT NULL, rejected_count INTEGER NOT NULL,
     preview INTEGER NOT NULL DEFAULT 0, errors_json TEXT NOT NULL DEFAULT '[]'
 );
+CREATE TABLE IF NOT EXISTS market_price_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL, price TEXT NOT NULL,
+    currency TEXT NOT NULL, source TEXT NOT NULL, market_status TEXT NOT NULL,
+    as_of TEXT NOT NULL, captured_at TEXT NOT NULL, exchange TEXT NOT NULL DEFAULT '',
+    UNIQUE(symbol, source, as_of)
+);
+CREATE INDEX IF NOT EXISTS idx_market_price_symbol_time ON market_price_snapshots(symbol, as_of DESC);
+CREATE TABLE IF NOT EXISTS market_bars (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL, interval TEXT NOT NULL,
+    open TEXT NOT NULL, high TEXT NOT NULL, low TEXT NOT NULL, close TEXT NOT NULL,
+    volume TEXT, currency TEXT NOT NULL, source TEXT NOT NULL, as_of TEXT NOT NULL,
+    UNIQUE(symbol, interval, source, as_of)
+);
+CREATE TABLE IF NOT EXISTS fx_rate_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, base_currency TEXT NOT NULL, quote_currency TEXT NOT NULL,
+    rate TEXT NOT NULL, source TEXT NOT NULL, as_of TEXT NOT NULL, captured_at TEXT NOT NULL,
+    UNIQUE(base_currency, quote_currency, source, as_of)
+);
+CREATE TABLE IF NOT EXISTS benchmark_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, benchmark TEXT NOT NULL, value TEXT NOT NULL,
+    currency TEXT NOT NULL, source TEXT NOT NULL, as_of TEXT NOT NULL, captured_at TEXT NOT NULL,
+    UNIQUE(benchmark, source, as_of)
+);
+CREATE INDEX IF NOT EXISTS idx_benchmark_time ON benchmark_snapshots(benchmark, as_of DESC);
 """
 
 
@@ -912,6 +936,43 @@ class Database:
 
     def list_provider_fills(self, *, broker_id: str, account_id: str) -> list[sqlite3.Row]:
         with self.connect() as conn: return conn.execute("SELECT * FROM provider_fills WHERE broker_id=? AND account_id=? ORDER BY provider_fill_id", (broker_id, account_id)).fetchall()
+
+    def save_market_quote(self, quote: Any) -> int:
+        with self.connect() as conn:
+            cur = conn.execute("INSERT INTO market_price_snapshots(symbol,price,currency,source,market_status,as_of,captured_at,exchange) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(symbol,source,as_of) DO UPDATE SET price=excluded.price,currency=excluded.currency,market_status=excluded.market_status,captured_at=excluded.captured_at,exchange=excluded.exchange", (quote.symbol, str(quote.price), quote.currency, quote.source, quote.market_status, quote.as_of, quote.captured_at, quote.exchange))
+            return int(cur.lastrowid or conn.execute("SELECT id FROM market_price_snapshots WHERE symbol=? AND source=? AND as_of=?", (quote.symbol, quote.source, quote.as_of)).fetchone()[0])
+
+    def list_market_quotes(self, *, symbol: str | None = None, source: str | None = None, limit: int = 200) -> list[sqlite3.Row]:
+        clauses, params = [], []
+        if symbol is not None: clauses.append("symbol=?"); params.append(symbol.upper())
+        if source is not None: clauses.append("source=?"); params.append(source)
+        params.append(limit)
+        with self.connect() as conn: return conn.execute("SELECT * FROM market_price_snapshots" + (" WHERE " + " AND ".join(clauses) if clauses else "") + " ORDER BY as_of DESC,id DESC LIMIT ?", params).fetchall()
+
+    def save_market_bar(self, bar: Any) -> int:
+        with self.connect() as conn:
+            cur = conn.execute("INSERT INTO market_bars(symbol,interval,open,high,low,close,volume,currency,source,as_of) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(symbol,interval,source,as_of) DO UPDATE SET open=excluded.open,high=excluded.high,low=excluded.low,close=excluded.close,volume=excluded.volume,currency=excluded.currency", (bar.symbol, bar.interval, str(bar.open), str(bar.high), str(bar.low), str(bar.close), None if bar.volume is None else str(bar.volume), bar.currency, bar.source, bar.as_of))
+            return int(cur.lastrowid or 0)
+
+    def save_fx_rate(self, rate: Any) -> int:
+        with self.connect() as conn:
+            cur = conn.execute("INSERT INTO fx_rate_snapshots(base_currency,quote_currency,rate,source,as_of,captured_at) VALUES(?,?,?,?,?,?) ON CONFLICT(base_currency,quote_currency,source,as_of) DO UPDATE SET rate=excluded.rate,captured_at=excluded.captured_at", (rate.base_currency, rate.quote_currency, str(rate.rate), rate.source, rate.as_of, rate.captured_at))
+            return int(cur.lastrowid or 0)
+
+    def list_fx_rates(self, *, base_currency: str | None = None, quote_currency: str | None = None) -> list[sqlite3.Row]:
+        clauses, params = [], []
+        if base_currency: clauses.append("base_currency=?"); params.append(base_currency.upper())
+        if quote_currency: clauses.append("quote_currency=?"); params.append(quote_currency.upper())
+        with self.connect() as conn: return conn.execute("SELECT * FROM fx_rate_snapshots" + (" WHERE " + " AND ".join(clauses) if clauses else "") + " ORDER BY as_of DESC,id DESC", params).fetchall()
+
+    def save_benchmark_snapshot(self, snapshot: Any) -> int:
+        with self.connect() as conn:
+            cur = conn.execute("INSERT INTO benchmark_snapshots(benchmark,value,currency,source,as_of,captured_at) VALUES(?,?,?,?,?,?) ON CONFLICT(benchmark,source,as_of) DO UPDATE SET value=excluded.value,currency=excluded.currency,captured_at=excluded.captured_at", (snapshot.benchmark, str(snapshot.value), snapshot.currency, snapshot.source, snapshot.as_of, snapshot.captured_at))
+            return int(cur.lastrowid or 0)
+
+    def list_benchmark_snapshots(self, *, benchmark: str | None = None, limit: int = 200) -> list[sqlite3.Row]:
+        params = [benchmark] if benchmark else []; query = "SELECT * FROM benchmark_snapshots" + (" WHERE benchmark=?" if benchmark else "") + " ORDER BY as_of ASC,id ASC LIMIT ?"; params.append(limit)
+        with self.connect() as conn: return conn.execute(query, params).fetchall()
 
     def list_holdings(self, portfolio: str | None = None) -> list[sqlite3.Row]:
         with self.connect() as conn: return conn.execute("SELECT * FROM holdings" + (" WHERE portfolio=?" if portfolio else "") + " ORDER BY portfolio, symbol", (portfolio,) if portfolio else ()).fetchall()
