@@ -81,6 +81,7 @@ def test_dashboard_rejects_legacy_horizontal_operator_navigation(tmp_path, monke
 def test_every_operator_workspace_uses_terminal_shell_and_controls(tmp_path, monkeypatch):
     client = auth_client(monkeypatch, Database(tmp_path / "console.sqlite3"))
     expected = {
+        "ledger": ("LEDGER / TAX SCOPE", "Preview import"),
         "agents": ("AGENT CONTROL PLANE", "Run now"),
         "trades": ("PAPER ORDER TICKET", "Submit paper order"),
         "integrations": ("INTEGRATIONS", "Refresh status"),
@@ -89,7 +90,7 @@ def test_every_operator_workspace_uses_terminal_shell_and_controls(tmp_path, mon
         "audit": ("RISK CONTROL", "AUDIT EVENT STREAM"),
         "settings": ("OPERATOR SETTINGS", "Save settings"),
     }
-    expected_nav = [("/", "Portfolio"), ("/page/trades", "Trades"), ("/page/agents", "Agents"), ("/page/integrations", "Integrations"), ("/page/strategies", "Strategies"), ("/page/scheduler", "Scheduler"), ("/page/audit", "Risk / Audit"), ("/page/settings", "Settings")]
+    expected_nav = [("/", "Portfolio"), ("/page/trades", "Trades"), ("/page/ledger", "Ledger / Tax"), ("/page/agents", "Agents"), ("/page/integrations", "Integrations"), ("/page/strategies", "Strategies"), ("/page/scheduler", "Scheduler"), ("/page/audit", "Risk / Audit"), ("/page/settings", "Settings")]
     pages = ["/"] + [f"/page/{section}" for section in expected]
     shells = []
     for path in pages:
@@ -137,3 +138,26 @@ def test_strategy_and_integration_surfaces_are_local(tmp_path, monkeypatch):
     status = client.get("/api/integrations").get_json()["integrations"]
     assert status["indmoney"]["read_only"] is True
     assert "unconfigured" in status["kite"]["status"]
+
+
+def test_ledger_workspace_renders_filters_import_controls_and_exports(tmp_path, monkeypatch):
+    db = Database(tmp_path / "ledger-console.sqlite3")
+    client = auth_client(monkeypatch, db)
+    page = client.get("/page/ledger?namespace=broker&portfolio=Main&symbol=INFY")
+    assert page.status_code == 200
+    html = page.get_data(as_text=True)
+    for marker in ("LEDGER / TAX SCOPE", "TRANSACTION IMPORT", "Preview import", "Commit import", "OPEN FIFO LOTS", "RECENT TRANSACTIONS / PROVENANCE", "UNAVAILABLE", "Export JSON", "Export CSV", "source", "csrf_token"):
+        assert marker in html
+    assert "/api/ledger/export?format=json" in html
+    assert "/api/ledger/export?format=csv" in html
+
+    payload = {"rows": [{"event_type": "buy", "symbol": "INFY", "quantity": "2", "price": "100", "event_date": "2026-01-01", "external_id": "ui-1"}], "namespace": "broker", "source": "operator-ui"}
+    assert client.post("/api/ledger/import/preview", json=payload).status_code == 403
+    with client.session_transaction() as session:
+        csrf = session["csrf_token"]
+    preview = client.post("/api/ledger/import/preview", json=payload, headers={"X-CSRF-Token": csrf})
+    assert preview.status_code == 200
+    assert preview.get_json()["accepted"] == 1
+    commit = client.post("/api/ledger/import", json=payload, headers={"X-CSRF-Token": csrf})
+    assert commit.status_code == 201
+    assert client.get("/api/ledger/events?namespace=broker").get_json()["events"][0]["source"] == "operator-ui"
