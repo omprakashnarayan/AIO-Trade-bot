@@ -240,6 +240,42 @@ CREATE TABLE IF NOT EXISTS research_feedback (
     user_id TEXT NOT NULL, created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_research_feedback_finding ON research_feedback(finding_id, id DESC);
+CREATE TABLE IF NOT EXISTS finance_goals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL DEFAULT '', portfolio_id TEXT NOT NULL DEFAULT '', namespace TEXT NOT NULL DEFAULT 'manual',
+    name TEXT NOT NULL, target_amount TEXT NOT NULL, current_amount TEXT NOT NULL, starting_amount TEXT NOT NULL DEFAULT '0', currency TEXT NOT NULL,
+    target_date TEXT, monthly_contribution TEXT NOT NULL DEFAULT '0', annual_return TEXT NOT NULL DEFAULT '0', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_finance_goals_scope ON finance_goals(namespace, account_id, portfolio_id);
+CREATE TABLE IF NOT EXISTS goal_contributions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, goal_id INTEGER NOT NULL REFERENCES finance_goals(id), amount TEXT NOT NULL, contributed_at TEXT NOT NULL,
+    source TEXT NOT NULL, provenance_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS cash_flow_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL DEFAULT '', portfolio_id TEXT NOT NULL DEFAULT '', namespace TEXT NOT NULL DEFAULT 'manual',
+    kind TEXT NOT NULL, amount TEXT NOT NULL, currency TEXT NOT NULL, occurred_at TEXT NOT NULL, category TEXT NOT NULL DEFAULT '', description TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL, provenance_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cash_flow_scope ON cash_flow_records(namespace, account_id, portfolio_id, occurred_at);
+CREATE TABLE IF NOT EXISTS liabilities (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL DEFAULT '', portfolio_id TEXT NOT NULL DEFAULT '', namespace TEXT NOT NULL DEFAULT 'manual',
+    name TEXT NOT NULL, principal TEXT NOT NULL, balance TEXT NOT NULL, interest_rate TEXT NOT NULL DEFAULT '0', due_date TEXT, minimum_payment TEXT NOT NULL DEFAULT '0',
+    currency TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open', source TEXT NOT NULL, provenance_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_liabilities_scope ON liabilities(namespace, account_id, portfolio_id, status);
+CREATE TABLE IF NOT EXISTS alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, namespace TEXT NOT NULL DEFAULT 'manual', account_id TEXT NOT NULL DEFAULT '', portfolio_id TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL,
+    severity TEXT NOT NULL, title TEXT NOT NULL, details_json TEXT NOT NULL DEFAULT '{}', fingerprint TEXT NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'open',
+    acknowledged_by TEXT, acknowledged_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alerts_status ON alerts(status, created_at);
+CREATE TABLE IF NOT EXISTS alert_deliveries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, alert_id INTEGER NOT NULL REFERENCES alerts(id), channel TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending',
+    delivered_at TEXT, read_at TEXT, error TEXT NOT NULL DEFAULT '', UNIQUE(alert_id, channel)
+);
+CREATE TABLE IF NOT EXISTS transaction_corrections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, transaction_id INTEGER NOT NULL, action TEXT NOT NULL, original_json TEXT NOT NULL, corrected_json TEXT NOT NULL,
+    reason TEXT NOT NULL, actor TEXT NOT NULL, created_at TEXT NOT NULL
+);
 """
 
 

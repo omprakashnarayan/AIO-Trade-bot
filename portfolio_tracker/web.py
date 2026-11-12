@@ -26,6 +26,7 @@ from .ledger import FinancialEvent, calculate, export_data, import_rows
 from .market_data import MarketDataService, BenchmarkSnapshot, _now
 from .analytics import portfolio_analytics
 from .research import add_evidence, run_research, portfolio_health, concentration_risk, placeholder
+from .finance_ops import (add_cash_flow, add_goal_contribution, add_liability, acknowledge_alert, backup_payload, correct_transaction, create_alert, create_goal, daily_report_data, list_alert_deliveries, list_goals, restore_backup, set_alert_delivery, write_backup)
 from .brokers.kite import KiteAdapter, KiteConfig
 from .brokers.upstox import UpstoxAdapter, UpstoxConfig
 
@@ -402,9 +403,10 @@ OPERATOR_PAGE_TEMPLATE = r'''
 {% elif section == 'strategies' %}<div class="card"><h2>PROPOSAL TICKET</h2><form id="strategy-form" class="form-grid"><label>Strategy<select name="strategy"><option>kite-short-term/v1</option><option>upstox-long-term/v1</option><option>indmoney-us-read-only/v1</option></select></label><label>Symbol<input name="symbol" value="INFY" required></label><label>Market<input name="market" value="INDIA"></label><label>Currency<input name="currency" value="INR"></label><label>Price<input name="price" type="number" step="0.01" required></label><label>Signal<select name="signal"><option>buy</option><option>sell</option><option>hold</option></select></label><label>Quantity<input name="quantity" value="1"></label><label>Source ID<input name="source_id" value="operator-input"></label><div class="actions"><button>Generate paper proposal</button></div></form><div id="result" class="status">Proposals are suggestions only and never execute.</div></div>
 {% elif section == 'scheduler' %}<div class="grid"><div class="card span-6"><h2>SCHEDULER CONTROL</h2><p>Enabled: <b>{{ 'YES' if data.enabled else 'NO' }}</b></p><div class="actions"><button onclick="postJson('/api/scheduler/state',{enabled:'true'})">Enable</button><button onclick="postJson('/api/scheduler/state',{enabled:'false'})">Disable</button><button onclick="postJson('/api/scheduler/run',{})">Run due proposals</button></div><div id="result" class="status">Scheduler is paper/proposal-only.</div></div><div class="card span-6"><h2>RECENT RUNS</h2><div class="table-wrap"><table><thead><tr><th>TIME</th><th>STATUS</th><th>DETAIL</th></tr></thead><tbody>{% for run in data.runs %}<tr><td>{{ run.created_at }}</td><td>{{ run.status }}</td><td>{{ run.message if run.message is defined else run }}</td></tr>{% else %}<tr><td colspan="3" class="muted">No scheduler runs.</td></tr>{% endfor %}</tbody></table></div></div></div>
 {% elif section == 'audit' %}<div class="grid"><div class="card span-6"><h2>RISK CONTROL</h2><p>Kill switch: <b>{{ data.kill_switch|upper }}</b></p><div class="actions"><button class="danger" onclick="postJson('/api/risk/kill-switch',{state:'on'})">Turn ON</button><button onclick="postJson('/api/risk/kill-switch',{state:'off'})">Turn OFF</button></div><div id="result" class="status">Risk actions are audited and paper-only.</div></div><div class="card span-6"><h2>LIVE APPROVALS</h2><p class="muted">Approval records never execute live orders.</p>{% for a in data.approvals %}<p>{{ a.id }} · {{ a.status }} · {{ a.proposal_id }}</p>{% else %}<p class="muted">No approval records.</p>{% endfor %}</div><div class="card span-12"><h2>AUDIT EVENT STREAM</h2><div class="table-wrap"><table><thead><tr><th>TIME</th><th>EVENT</th><th>ENTITY</th><th>MODE</th></tr></thead><tbody>{% for e in data.events %}<tr><td>{{ e.created_at }}</td><td>{{ e.event_type }}</td><td>{{ e.entity_type }} {{ e.entity_id }}</td><td>{{ e.mode }}</td></tr>{% else %}<tr><td colspan="4" class="muted">No audit events.</td></tr>{% endfor %}</tbody></table></div></div></div>
+{% elif section == 'finance' %}<div class="grid"><div class="card span-6"><h2>GOALS / TARGETS</h2><p class="muted">Durable progress, monthly contributions, and Decimal forecasts.</p><form id="goal-form" class="form-grid"><label>Name<input name="name" required></label><label>Target<input name="target_amount" required></label><label>Starting<input name="starting_amount" value="0"></label><label>Monthly<input name="monthly_contribution" value="0"></label><label>Annual return %<input name="annual_return" value="0"></label><button type="submit">Create goal</button></form><pre id="goals-json">{{ data.goals|tojson(indent=2) }}</pre></div><div class="card span-6"><h2>CASH FLOW / LIABILITIES</h2><p class="muted">Manual records retain namespace and provenance.</p><button onclick="postJson('/api/finance/cash-flow',{kind:'income',amount:'0',source:'operator'})">Add cash-flow record</button><button onclick="postJson('/api/finance/liabilities',{name:'New liability',balance:'0',principal:'0',source:'operator'})">Add liability</button><pre>{{ data.cash_flow|tojson(indent=2) }}</pre></div><div class="card span-6"><h2>ALERTS / DELIVERY STATE</h2><p class="muted">Risk breach, drawdown, stale quotes, sync failure, OAuth expiry, and agent failure alerts are durable and deduplicated.</p><button onclick="postJson('/api/finance/alerts',{kind:'stale_quotes',title:'Stale quotes',fingerprint:'operator-stale-quotes'})">Create stale-quote alert</button><pre>{{ data.alerts|tojson(indent=2) }}</pre></div><div class="card span-6"><h2>BACKUP / DAILY REPORT</h2><p class="muted">Exports redact secret-looking fields and are integrity checked on restore.</p><button onclick="fetch('/api/finance/backup').then(r=>r.json()).then(d=>show(JSON.stringify(d,null,2)))">Preview redacted backup</button><a class="button" href="/api/finance/daily-report">Daily report JSON</a><pre>{{ data.liabilities|tojson(indent=2) }}</pre></div></div>
 {% elif section == 'settings' %}<div class="card"><h2>OPERATOR SETTINGS</h2><form method="post" action="/settings" class="form-grid"><label>Owner name<input name="owner_name" value="{{ data.owner_name }}"></label><label>Risk profile<select name="risk_profile">{% for option in ['low','balanced','aggressive'] %}<option value="{{ option }}" {% if data.risk_profile == option %}selected{% endif %}>{{ option }}</option>{% endfor %}</select></label><label>Trading mode<select name="trading_mode"><option value="paper" {% if data.trading_mode == 'paper' %}selected{% endif %}>Paper only</option><option value="approval_required" {% if data.trading_mode == 'approval_required' %}selected{% endif %}>Approval records only</option></select></label><label>Max order notional<input name="max_order_notional" value="{{ data.max_order_notional }}"></label><label>Max position weight<input name="max_position_weight" value="{{ data.max_position_weight }}"></label><label>Scheduler enabled<select name="scheduler_enabled"><option value="false" {% if not data.scheduler_enabled %}selected{% endif %}>No</option><option value="true" {% if data.scheduler_enabled %}selected{% endif %}>Yes</option></select></label><label>Default account ID<input name="default_account_id" value="{{ data.default_account_id }}"></label><label>Default portfolio ID<input name="default_portfolio_id" value="{{ data.default_portfolio_id }}"></label><label>Default currency<input name="default_currency" value="{{ data.default_currency }}"></label><label>Monthly contribution<input name="monthly_contribution" value="{{ data.monthly_contribution }}"></label><label>Reminder time<input name="reminder_time" value="{{ data.reminder_time }}"></label><label style="grid-column:1/-1">Notes<textarea name="notes">{{ data.notes }}</textarea></label><button>Save settings</button></form><p class="muted">Stored in the application data volume; not Docker environment variables.</p><div id="result" class="status">Settings validation errors are shown here after submission.</div></div>
 {% endif %}{% endif %}</section></main><footer class="footer"><span class="up">● SYSTEM READY</span> · AUTHENTICATED · LOCAL DATA · PAPER MODE · <span id="footer-status">polling bounded / hidden-tab paused</span></footer></div><div id="toast" class="toast" role="status"></div><div class="palette" id="palette"><div class="palette-box"><input id="palette-input" aria-label="Command palette" placeholder="Type a command…"><div class="commands" id="commands"></div></div></div>
-<script>const csrf={{ csrf_token|tojson }};const commands=[['portfolio','Open portfolio','/'],['agents','Open agents','/page/agents'],['trades','Open paper trades','/page/trades'],['ledger','Open ledger and tax','/page/ledger'],['integrations','Open integrations','/page/integrations'],['strategies','Open strategies','/page/strategies'],['scheduler','Open scheduler','/page/scheduler'],['audit','Open risk and audit','/page/audit'],['settings','Open settings','/page/settings'],['risk-review','Run risk review','agent:risk_review'],['kill-switch','Enable kill switch','action:kill-switch']];const result=()=>document.getElementById('result');function show(msg,err=false){const b=result();if(b){b.textContent=msg;b.className='status'+(err?' error':'')}const t=document.getElementById('toast');t.textContent=msg;t.style.display='block';setTimeout(()=>t.style.display='none',3500)}async function postJson(url,payload){try{const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify(payload)});const d=await r.json();show(JSON.stringify(d,null,2),!r.ok);if(r.ok)setTimeout(()=>location.reload(),500)}catch(e){show(String(e),true)}}async function agentAction(name,action,value){const url=action==='toggle'?'/api/agents/'+encodeURIComponent(name):'/api/agents/'+encodeURIComponent(name)+'/'+(action==='retry'?'retry':'run');await postJson(url,action==='toggle'?{enabled:value}:{test:value})}async function agentLogs(name){try{const r=await fetch('/api/agents/'+encodeURIComponent(name)+'/runs');show(JSON.stringify(await r.json(),null,2),!r.ok)}catch(e){show(String(e),true)}}async function syncIntegration(name){await postJson('/api/integrations/'+name+'/sync',{})}document.getElementById('paper-order')?.addEventListener('submit',async e=>{e.preventDefault();await postJson('/api/orders/paper',Object.fromEntries(new FormData(e.target)))})
+<script>const csrf={{ csrf_token|tojson }};const commands=[['portfolio','Open portfolio','/'],['agents','Open agents','/page/agents'],['trades','Open paper trades','/page/trades'],['ledger','Open ledger and tax','/page/ledger'],['integrations','Open integrations','/page/integrations'],['strategies','Open strategies','/page/strategies'],['scheduler','Open scheduler','/page/scheduler'],['audit','Open risk and audit','/page/audit'],['settings','Open settings','/page/settings'],['finance','Open finance operations','/page/finance'],['risk-review','Run risk review','agent:risk_review'],['kill-switch','Enable kill switch','action:kill-switch']];const result=()=>document.getElementById('result');function show(msg,err=false){const b=result();if(b){b.textContent=msg;b.className='status'+(err?' error':'')}const t=document.getElementById('toast');t.textContent=msg;t.style.display='block';setTimeout(()=>t.style.display='none',3500)}async function postJson(url,payload){try{const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify(payload)});const d=await r.json();show(JSON.stringify(d,null,2),!r.ok);if(r.ok)setTimeout(()=>location.reload(),500)}catch(e){show(String(e),true)}}async function agentAction(name,action,value){const url=action==='toggle'?'/api/agents/'+encodeURIComponent(name):'/api/agents/'+encodeURIComponent(name)+'/'+(action==='retry'?'retry':'run');await postJson(url,action==='toggle'?{enabled:value}:{test:value})}async function agentLogs(name){try{const r=await fetch('/api/agents/'+encodeURIComponent(name)+'/runs');show(JSON.stringify(await r.json(),null,2),!r.ok)}catch(e){show(String(e),true)}}async function syncIntegration(name){await postJson('/api/integrations/'+name+'/sync',{})}document.getElementById('paper-order')?.addEventListener('submit',async e=>{e.preventDefault();await postJson('/api/orders/paper',Object.fromEntries(new FormData(e.target)))});document.getElementById('goal-form')?.addEventListener('submit',async e=>{e.preventDefault();const p=Object.fromEntries(new FormData(e.target));await postJson('/api/finance/goals',p)})
 const ledgerPayload=()=>{const f=document.getElementById('ledger-import');const p=Object.fromEntries(new FormData(f));try{p.rows=JSON.parse(p.rows)}catch(e){throw new Error('Rows JSON is invalid')}delete p.csrf_token;return p};async function ledgerImport(preview){try{const r=await fetch('/api/ledger/import'+(preview?'/preview':''),{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify(ledgerPayload())});const d=await r.json();const b=document.getElementById('ledger-result');if(b)b.textContent=JSON.stringify(d,null,2);if(!r.ok)throw new Error(d.error||'Ledger request failed');if(!preview)setTimeout(()=>location.reload(),500)}catch(e){const b=document.getElementById('ledger-result');if(b){b.textContent=String(e);b.className='status error'}}}document.getElementById('ledger-preview')?.addEventListener('click',()=>ledgerImport(true));document.getElementById('ledger-import')?.addEventListener('submit',e=>{e.preventDefault();ledgerImport(false)})
 document.getElementById('strategy-form')?.addEventListener('submit',async e=>{e.preventDefault();const p=Object.fromEntries(new FormData(e.target));p.as_of=new Date().toISOString();p.now=p.as_of;await postJson('/api/strategies/proposals',p)})
 document.querySelectorAll('[data-action="kill-switch"]').forEach(b=>b.addEventListener('click',()=>{if(confirm('Enable the global paper-trading kill switch?'))postJson('/api/risk/kill-switch',{state:'on'})}));const palette=document.getElementById('palette'),pi=document.getElementById('palette-input'),list=document.getElementById('commands');function render(q=''){list.innerHTML=commands.filter(c=>(c[0]+' '+c[1]).toLowerCase().includes(q.toLowerCase())).map(c=>`<button type="button" data-cmd="${c[0]}"><b>${c[0]}</b><small>${c[1]}</small></button>`).join('')}function openPalette(){palette.classList.add('open');render();pi.focus()}function closePalette(){palette.classList.remove('open')}document.getElementById('palette-button').onclick=openPalette;document.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='k'){e.preventDefault();openPalette()}if(e.key==='Escape')closePalette()});pi.oninput=()=>render(pi.value);list.onclick=e=>{const b=e.target.closest('[data-cmd]');if(!b)return;const c=commands.find(x=>x[0]===b.dataset.cmd);closePalette();if(c[2].startsWith('/'))location.href=c[2];else if(c[2].startsWith('agent:'))agentAction(c[2].slice(6),'run',true);else if(c[2]==='action:kill-switch'&&confirm('Enable the global paper-trading kill switch?'))postJson('/api/risk/kill-switch',{state:'on'})};document.getElementById('command-form').onsubmit=e=>{e.preventDefault();const q=document.getElementById('command-input').value.trim().toLowerCase();const c=commands.find(x=>x[0]===q||x[1].toLowerCase().includes(q));if(c){if(c[2].startsWith('/'))location.href=c[2];else if(c[2].startsWith('agent:'))agentAction(c[2].slice(6),'run',true);else if(confirm('Enable the global paper-trading kill switch?'))postJson('/api/risk/kill-switch',{state:'on'})}else show('Unknown command: '+q,true)});async function poll(){if(document.hidden)return;try{const r=await fetch('/api/console/snapshot',{headers:{'X-CSRF-Token':csrf}});if(!r.ok)throw new Error('Polling failed: HTTP '+r.status);document.getElementById('footer-status').textContent='polling healthy · '+new Date().toLocaleTimeString()}catch(e){document.getElementById('footer-status').textContent='STALE / '+e.message;document.getElementById('footer-status').className='down'}}setTimeout(poll,30000);setInterval(poll,30000);render();</script></body></html>
@@ -461,7 +463,7 @@ def api_portfolio_analytics():
 
 @app.get("/page/<section>")
 def operator_page(section: str):
-    if section not in {"trades", "ledger", "analytics", "agents", "research", "integrations", "strategies", "scheduler", "audit", "settings"}:
+    if section not in {"trades", "ledger", "analytics", "agents", "research", "integrations", "strategies", "scheduler", "audit", "settings", "finance"}:
         return jsonify({"error": "unknown operator page"}), 404
     db = Database(); db.init_db()
     if section == "trades": data = {"orders": _json_rows(db.list_order_intents()), "transactions": _json_rows(db.list_transactions())}
@@ -481,8 +483,9 @@ def operator_page(section: str):
     elif section == "scheduler": data = _scheduler_snapshot(db)
     elif section == "audit": data = {"kill_switch": db.get_console_state("global_kill_switch", "off"), "events": _json_rows(db.list_audit_events(limit=100)), "approvals": _json_rows(db.list_live_approvals())}
     elif section == "settings": data = load_settings()
+    elif section == "finance": data = daily_report_data(db)
     else: data = {"paper_only": True, "supported": ["kite-short-term/v1", "upstox-long-term/v1", "indmoney-us-read-only/v1"], "note": "Strategies accept caller-supplied facts only and never submit orders."}
-    descriptions = {"analytics": "Quote freshness, portfolio value, P/L, drawdown, concentration, and benchmark comparison from verified or manual snapshots.", "agents": "Enable, disable, test, run, retry, and inspect durable local agents.", "research": "Evidence, bounded findings, feedback, and paper-only decision support.", "trades": "Paper orders use the execution gateway; manual transactions remain local ledger records.", "ledger": "Import, reconcile, inspect FIFO cost basis, and export tax-ready ledger data.", "integrations": "Provider connectors are reported honestly from configuration only; no network calls are made.", "strategies": "Generate expiring proposals from supplied facts; proposals do not execute.", "scheduler": "Durable scheduler state and run outcomes.", "audit": "Append-only events, risk posture, kill switch, and live approval records.", "settings": "Local operator preferences and deployment posture."}
+    descriptions = {"analytics": "Quote freshness, portfolio value, P/L, drawdown, concentration, and benchmark comparison from verified or manual snapshots.", "agents": "Enable, disable, test, run, retry, and inspect durable local agents.", "research": "Evidence, bounded findings, feedback, and paper-only decision support.", "trades": "Paper orders use the execution gateway; manual transactions remain local ledger records.", "ledger": "Import, reconcile, inspect FIFO cost basis, and export tax-ready ledger data.", "integrations": "Provider connectors are reported honestly from configuration only; no network calls are made.", "strategies": "Generate expiring proposals from supplied facts; proposals do not execute.", "scheduler": "Durable scheduler state and run outcomes.", "audit": "Append-only events, risk posture, kill switch, and live approval records.", "settings": "Local operator preferences and deployment posture.", "finance": "Goals, cash flow, liabilities, alerts, backups, corrections, and daily reports from local data."}
     return render_template_string(OPERATOR_PAGE_TEMPLATE, section=section, description=descriptions[section], data=data)
 
 
@@ -935,6 +938,137 @@ def api_decide_approval(approval_id: int):
     if not changed: return jsonify({"error": "approval not found or already decided"}), 404
     db.append_audit_event(event_type="live.approval.decided", entity_type="approval", entity_id=str(approval_id), payload={"status": status}, mode="live")
     return jsonify({"id": approval_id, "status": status, "execution": "still disabled"})
+
+
+@app.get("/api/finance/goals")
+def api_finance_goals():
+    db = Database(); db.init_db()
+    return jsonify({"goals": list_goals(db, account_id=request.args.get("account_id"), portfolio_id=request.args.get("portfolio_id"), namespace=request.args.get("namespace"))})
+
+
+@app.post("/api/finance/goals")
+def api_finance_goal_create():
+    if not _csrf_ok(): return jsonify({"error": "CSRF validation failed"}), 403
+    try:
+        db = Database(); db.init_db(); goal_id = create_goal(db, _payload()); return jsonify({"id": goal_id, "goals": list_goals(db)}), 201
+    except (KeyError, TypeError, ValueError) as exc: return jsonify({"error": str(exc)}), 400
+
+
+@app.post("/api/finance/goals/<int:goal_id>/contributions")
+def api_finance_goal_contribution(goal_id: int):
+    if not _csrf_ok(): return jsonify({"error": "CSRF validation failed"}), 403
+    try:
+        payload = _payload(); db = Database(); db.init_db(); contribution_id = add_goal_contribution(db, goal_id, payload["amount"], contributed_at=payload.get("contributed_at"), source=str(payload.get("source", "manual")), provenance=payload.get("provenance")); return jsonify({"id": contribution_id, "goals": list_goals(db)}), 201
+    except (KeyError, TypeError, ValueError) as exc: return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/finance/cash-flow", methods=["GET", "POST"])
+def api_finance_cash_flow():
+    db = Database(); db.init_db()
+    if request.method == "GET":
+        clauses=[]; params=[]
+        for key in ("namespace", "account_id", "portfolio_id"):
+            if request.args.get(key) is not None: clauses.append(key+"=?"); params.append(request.args[key])
+        with db.connect() as c: rows = [dict(r) for r in c.execute("SELECT * FROM cash_flow_records" + (" WHERE " + " AND ".join(clauses) if clauses else "") + " ORDER BY occurred_at DESC, id DESC", params).fetchall()]
+        return jsonify({"cash_flow": rows})
+    if not _csrf_ok(): return jsonify({"error": "CSRF validation failed"}), 403
+    try: return jsonify({"id": add_cash_flow(db, _payload())}), 201
+    except (KeyError, TypeError, ValueError) as exc: return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/finance/liabilities", methods=["GET", "POST"])
+def api_finance_liabilities():
+    db = Database(); db.init_db()
+    if request.method == "GET":
+        clauses=[]; params=[]
+        for key in ("namespace", "account_id", "portfolio_id"):
+            if request.args.get(key) is not None: clauses.append(key+"=?"); params.append(request.args[key])
+        with db.connect() as c: rows = [dict(r) for r in c.execute("SELECT * FROM liabilities" + (" WHERE " + " AND ".join(clauses) if clauses else "") + " ORDER BY due_date, id", params).fetchall()]
+        return jsonify({"liabilities": rows})
+    if not _csrf_ok(): return jsonify({"error": "CSRF validation failed"}), 403
+    try: return jsonify({"id": add_liability(db, _payload())}), 201
+    except (KeyError, TypeError, ValueError) as exc: return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/finance/alerts", methods=["GET", "POST"])
+def api_finance_alerts():
+    db = Database(); db.init_db()
+    if request.method == "GET":
+        clauses=[]; params=[]
+        for key in ("namespace", "account_id", "portfolio_id", "status"):
+            if request.args.get(key) is not None: clauses.append(key+"=?"); params.append(request.args[key])
+        with db.connect() as c: rows = [dict(r) for r in c.execute("SELECT * FROM alerts" + (" WHERE " + " AND ".join(clauses) if clauses else "") + " ORDER BY created_at DESC", params).fetchall()]
+        return jsonify({"alerts": rows})
+    if not _csrf_ok(): return jsonify({"error": "CSRF validation failed"}), 403
+    try: return jsonify({"id": create_alert(db, _payload())}), 201
+    except (KeyError, TypeError, ValueError) as exc: return jsonify({"error": str(exc)}), 400
+
+
+@app.post("/api/finance/alerts/<int:alert_id>/acknowledge")
+def api_finance_alert_ack(alert_id: int):
+    if not _csrf_ok(): return jsonify({"error": "CSRF validation failed"}), 403
+    db = Database(); db.init_db()
+    if not acknowledge_alert(db, alert_id, actor=str(session.get("operator", "operator"))): return jsonify({"error": "alert not found or already acknowledged"}), 404
+    return jsonify({"id": alert_id, "status": "acknowledged"})
+
+
+@app.get("/api/finance/daily-report")
+def api_finance_daily_report():
+    db = Database(); db.init_db(); return jsonify(daily_report_data(db))
+
+
+@app.route("/api/finance/backup", methods=["GET", "POST"])
+def api_finance_backup():
+    db = Database(); db.init_db()
+    if request.method == "GET": return jsonify(backup_payload(db))
+    if not _csrf_ok(): return jsonify({"error": "CSRF validation failed"}), 403
+    path = _payload().get("path")
+    if not path: return jsonify({"error": "path is required"}), 400
+    try: return jsonify(write_backup(db, path)), 201
+    except (OSError, ValueError) as exc: return jsonify({"error": str(exc)}), 400
+
+
+@app.post("/api/finance/backup/restore")
+def api_finance_backup_restore():
+    if not _csrf_ok(): return jsonify({"error": "CSRF validation failed"}), 403
+    path = _payload().get("path")
+    if not path: return jsonify({"error": "path is required"}), 400
+    try: db = Database(); db.init_db(); return jsonify({"restored": restore_backup(db, path)})
+    except (OSError, ValueError, json.JSONDecodeError) as exc: return jsonify({"error": str(exc)}), 400
+
+
+@app.get("/api/finance/alerts/<int:alert_id>/deliveries")
+def api_finance_alert_deliveries(alert_id: int):
+    db = Database(); db.init_db(); return jsonify({"deliveries": list_alert_deliveries(db, alert_id)})
+
+
+@app.post("/api/finance/alerts/<int:alert_id>/deliveries")
+def api_finance_alert_delivery_update(alert_id: int):
+    if not _csrf_ok(): return jsonify({"error": "CSRF validation failed"}), 403
+    try:
+        payload = _payload(); db = Database(); db.init_db(); set_alert_delivery(db, alert_id, str(payload["channel"]), state=str(payload.get("state", "delivered")), error=str(payload.get("error", "")), read=bool(payload.get("read", False))); return jsonify({"deliveries": list_alert_deliveries(db, alert_id)})
+    except (KeyError, TypeError, ValueError) as exc: return jsonify({"error": str(exc)}), 400
+
+
+@app.get("/api/finance/transactions/<int:transaction_id>/corrections")
+def api_finance_transaction_corrections(transaction_id: int):
+    db = Database(); db.init_db()
+    with db.connect() as c: rows = [dict(r) for r in c.execute("SELECT * FROM transaction_corrections WHERE transaction_id=? ORDER BY id", (transaction_id,)).fetchall()]
+    return jsonify({"corrections": rows})
+
+
+@app.post("/api/finance/transactions/<int:transaction_id>/reversal")
+def api_finance_transaction_reversal(transaction_id: int):
+    if not _csrf_ok(): return jsonify({"error": "CSRF validation failed"}), 403
+    try: db = Database(); db.init_db(); return jsonify({"id": correct_transaction(db, transaction_id, {"reversal_of": transaction_id, "reason": str(_payload().get("reason", "manual reversal"))}, actor=str(session.get("operator", "operator")))}), 201
+    except (KeyError, TypeError, ValueError) as exc: return jsonify({"error": str(exc)}), 400
+
+
+@app.post("/api/finance/transactions/<int:transaction_id>/correction")
+def api_finance_transaction_correction(transaction_id: int):
+    if not _csrf_ok(): return jsonify({"error": "CSRF validation failed"}), 403
+    try: db = Database(); db.init_db(); return jsonify({"id": correct_transaction(db, transaction_id, _payload(), actor=str(session.get("operator", "operator")))}), 201
+    except (KeyError, TypeError, ValueError) as exc: return jsonify({"error": str(exc)}), 400
 
 
 def main(host: str = "127.0.0.1", port: int = 5055, debug: bool = False):
