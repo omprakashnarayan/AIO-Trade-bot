@@ -63,6 +63,10 @@ def test_terminal_workspace_renders_functional_panels_and_safe_controls(tmp_path
     assert "UNAVAILABLE" in html
     assert "X-CSRF-Token" in html
     assert "setTimeout(poll,30000)" in html
+    assert "font:13px/1.5 var(--sans)" in html
+    assert "@media(max-width:820px)" in html
+    assert 'id="paper-order"' not in html  # dashboard has no order form
+    assert 'data-action="kill-switch"' in html
 
 
 def test_dashboard_rejects_legacy_horizontal_operator_navigation(tmp_path, monkeypatch):
