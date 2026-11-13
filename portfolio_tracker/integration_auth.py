@@ -132,9 +132,10 @@ def authorization_url(secret_key: str | bytes, provider: str, state: str) -> str
     raise ValueError("INDmoney uses an MCP-capable client and has no app callback here")
 
 
-def _post_form(url: str, form: dict[str, str]) -> dict[str, Any]:
+def _post_form(url: str, form: dict[str, str], *, headers: dict[str, str] | None = None) -> dict[str, Any]:
     body = urllib.parse.urlencode(form).encode()
-    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"}, method="POST")
+    request_headers = {"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json", **(headers or {})}
+    req = urllib.request.Request(url, data=body, headers=request_headers, method="POST")
     with urllib.request.urlopen(req, timeout=20) as response:
         return json.loads(response.read().decode())
 
@@ -143,8 +144,8 @@ def exchange_code(secret_key: str | bytes, provider: str, code: str) -> dict[str
     record = get_provider(secret_key, provider)
     if provider == "kite":
         request_token = code
-        checksum = hashlib.sha256((record["api_key"] + record["api_secret"] + request_token).encode()).hexdigest()
-        payload = _post_form("https://api.kite.trade/session/token", {"api_key": record["api_key"], "request_token": request_token, "checksum": checksum})
+        checksum = hashlib.sha256((record["api_key"] + request_token + record["api_secret"]).encode()).hexdigest()
+        payload = _post_form("https://api.kite.trade/session/token", {"api_key": record["api_key"], "request_token": request_token, "checksum": checksum}, headers={"X-Kite-Version": "3"})
     elif provider == "upstox":
         payload = _post_form("https://api.upstox.com/v2/login/authorization/token", {"code": code, "client_id": record["client_id"], "client_secret": record["client_secret"], "redirect_uri": record["redirect_uri"], "grant_type": "authorization_code"})
     else:

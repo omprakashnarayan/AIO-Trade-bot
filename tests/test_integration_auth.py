@@ -40,7 +40,7 @@ def test_oauth_state_and_kite_exchange(monkeypatch, tmp_path):
     assert start.status_code == 302
     with c.session_transaction() as sess:
         started_at = sess["oauth_state"]["started_at"]
-    monkeypatch.setattr(integration_auth, "_post_form", lambda url, form: {"access_token": "access", "expires_in": 3600})
+    monkeypatch.setattr(integration_auth, "_post_form", lambda url, form, **kwargs: {"access_token": "access", "expires_in": 3600})
     # Kite's callback omits OAuth state; the authenticated browser session and
     # short start window bind the one-time request token instead.
     done = c.get("/oauth/kite/callback?request_token=req")
@@ -58,7 +58,7 @@ def test_expired_callback_and_disconnect(monkeypatch, tmp_path):
     c.post("/api/integrations/upstox/connect", headers={"X-CSRF-Token": token})
     with c.session_transaction() as sess:
         state = sess["oauth_state"]["value"]
-    monkeypatch.setattr(integration_auth, "_post_form", lambda url, form: {"access_token": "access", "expires_in": 1})
+    monkeypatch.setattr(integration_auth, "_post_form", lambda url, form, **kwargs: {"access_token": "access", "expires_in": 1})
     assert c.get(f"/oauth/upstox/callback?state={state}&code=code").status_code == 302
     record = integration_auth.get_provider(str(web.app.secret_key), "upstox")
     record["expires_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
