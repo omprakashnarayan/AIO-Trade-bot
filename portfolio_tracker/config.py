@@ -24,7 +24,17 @@ DEFAULT_SETTINGS = {
     "default_account_id": "operator",
     "default_portfolio_id": "Main",
     "default_currency": "INR",
+    "provider_modes": {"kite": "mcp_only", "upstox": "mcp_only", "indmoney": "mcp_only"},
 }
+
+# Verified official hosted MCP endpoints. Provider reads never use REST/API when
+# the mode is mcp_only; authorization is performed by the provider in a browser.
+OFFICIAL_MCP_ENDPOINTS = {
+    "kite": {"url": "https://mcp.kite.trade/mcp", "read_only": True},
+    # Upstox endpoint is intentionally absent until verified from official docs.
+    "indmoney": {"url": "https://mcp.indmoney.com/mcp", "read_only": True},
+}
+
 
 
 def ensure_dirs() -> None:

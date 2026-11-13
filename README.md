@@ -173,6 +173,33 @@ The local app MCP endpoint is `POST /mcp`. It implements JSON-RPC `initialize`, 
 
 Kite and Upstox bridges accept only discovered, schema-verified injectable transports. A provider is reported `unconfigured` until an authorized transport is supplied and a normalized snapshot reconciles successfully. INDmoney remains read-only/manual/MCP handoff.
 
+## MCP-only broker integration
+
+Provider synchronization is explicitly `mcp_only`. The app does not use Kite,
+Upstox, or INDmoney REST/API transports for provider reads when this mode is
+selected. Every provider read requires MCP initialize, `tools/list`, input-schema
+validation, a discovered read tool, normalized snapshot persistence, and
+broker-scoped reconciliation. No connected data is claimed until a real
+authorized MCP read succeeds.
+
+Verified hosted endpoints in this phase:
+
+- Kite: `https://mcp.kite.trade/mcp` (official Zerodha hosted MCP; read-only policy)
+- Upstox: unconfigured until an official MCP endpoint is verified (no guessed URL is used)
+- INDmoney: `https://mcp.indmoney.com/mcp` (read-only browser/client handoff; no writes)
+
+Authorization is browser-based at the provider MCP endpoint. Existing Kite
+OAuth/API status is preserved for historical visibility, but it is not used for
+MCP-only synchronization. The Integrations page exposes provider mode, endpoint,
+authorization handoff, discovered tools, reconnect, and sync status. Failures
+remain honest (`unconfigured`, `authorization_required`, or `error`).
+
+The local app MCP endpoint exposes only broker MCP status and verified persisted
+snapshots in addition to existing local read/paper tools. It never returns
+provider credentials and never exposes live order tools. Manual, broker, and
+paper ledger namespaces remain isolated.
+
+
 Exact verification:
 
 ```bash

@@ -1,36 +1,40 @@
-# Credential-free Hermes Agent example. Do not add secrets to this file.
-# The local app endpoint is callable only with an operator session or
-# PORTFOLIO_MCP_API_TOKEN configured at runtime.
+# Credential-free MCP configuration example. Do not add secrets.
+# Provider reads use MCP only. OAuth/API credentials are not used for sync.
 mcp_servers:
   portfolio_tracker:
     url: "http://127.0.0.1:5055/mcp"
     timeout: 30
     connect_timeout: 5
     headers: {}
-    sampling:
-      enabled: false
     policy:
       status: configured_endpoint_requires_runtime_auth
-      capabilities: [health, portfolio_read, paper_proposals, paper_orders, promotion_gates]
+      capabilities: [health, portfolio_read, paper_proposals, paper_orders, promotion_gates, provider_mcp_status, provider_mcp_snapshot]
       live_orders: disabled
 
   kite:
-    url: "# configure only after discovering and verifying an authorized provider MCP transport"
+    url: "https://mcp.kite.trade/mcp"
     policy:
-      status: unconfigured
-      capabilities: [read_only_after_discovery_and_reconciliation]
+      mode: mcp_only
+      status: browser_authorization_required_until_real_read_succeeds
+      capabilities: [read_only_after_discovery_schema_validation_and_reconciliation]
       writes: disabled
+      oauth_api_sync: disabled
+      source: "official Zerodha hosted MCP endpoint"
 
   upstox:
-    url: "# configure only after discovering and verifying an authorized provider MCP transport"
+    url: "# unconfigured: no official endpoint verified"
     policy:
-      status: unconfigured
-      capabilities: [read_only_after_discovery_and_reconciliation]
+      mode: mcp_only
+      status: unconfigured_honest_no_verified_official_endpoint
+      capabilities: [read_only_after_discovery_schema_validation_and_reconciliation]
       writes: disabled
+      oauth_api_sync: disabled
 
   indmoney:
-    url: "# manual/MCP handoff only; no local execution adapter"
+    url: "https://mcp.indmoney.com/mcp"
     policy:
-      status: read_only
-      capabilities: [manual_import, read_only_handoff]
+      mode: mcp_only
+      status: read_only_browser_handoff; no connected data claimed without verified read
+      capabilities: [read_only_after_discovery_schema_validation_and_reconciliation]
       writes: disabled
+      oauth_api_sync: disabled

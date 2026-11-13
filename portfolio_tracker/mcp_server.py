@@ -29,7 +29,9 @@ TOOLS = [
     {"name":"market_data_status","description":"Market data cache status","inputSchema":{"type":"object","properties":{}},"annotations":{"readOnlyHint":True},"x-scope":"global"},
     {"name":"research_findings","description":"Stored research findings","inputSchema":{"type":"object","properties":{"symbol":{"type":"string"}}},"annotations":{"readOnlyHint":True},"x-scope":"portfolio"},
     {"name":"finance_goals_alerts","description":"Scoped finance goals and alerts","inputSchema":{"type":"object","properties":{}},"annotations":{"readOnlyHint":True},"x-scope":"portfolio"},
-    {"name":"provider_integration_status","description":"Provider capability states; no credentials returned","inputSchema":{"type":"object","properties":{}},"annotations":{"readOnlyHint":True},"x-scope":"global"},
+    {"name":"provider_integration_status","description":"Provider MCP capability states; no credentials returned","inputSchema":{"type":"object","properties":{}},"annotations":{"readOnlyHint":True},"x-scope":"global"},
+    {"name":"provider_mcp_status","description":"MCP-only broker status and discovered read tools; no credentials","inputSchema":{"type":"object","properties":{}},"annotations":{"readOnlyHint":True},"x-scope":"global"},
+    {"name":"provider_mcp_snapshot","description":"Verified persisted broker MCP snapshot, read-only","inputSchema":{"type":"object","required":["broker_id","account_id"],"properties":{"broker_id":{"type":"string"},"account_id":{"type":"string"}}},"annotations":{"readOnlyHint":True},"x-scope":"global"},
     {"name":"paper_proposal_create","description":"Record a paper proposal (does not submit)","inputSchema":{"type":"object","required":["symbol","side","quantity"],"properties":{"symbol":{"type":"string"},"side":{"type":"string","enum":["buy","sell"]},"quantity":{"type":"string"},"portfolio_id":{"type":"string"},"account_id":{"type":"string"}}},"x-scope":"portfolio","x-capability":"paper"},
     {"name":"paper_order_submit","description":"Submit a validated paper order through ExecutionGateway","inputSchema":{"type":"object","required":["idempotency_key","symbol","side","quantity","quote_price"],"properties":{"idempotency_key":{"type":"string"},"symbol":{"type":"string"},"side":{"type":"string","enum":["buy","sell"]},"quantity":{"type":"string"},"quote_price":{"type":"string"},"portfolio_id":{"type":"string"},"account_id":{"type":"string"},"order_type":{"type":"string","enum":["market","limit"]},"limit_price":{"type":"string"}}},"x-scope":"portfolio","x-capability":"paper","x-mutating":True},
     {"name":"promotion_gate_status","description":"Promotion gate checklist status","inputSchema":{"type":"object","properties":{}},"annotations":{"readOnlyHint":True},"x-scope":"global"},
@@ -72,7 +74,19 @@ class MCPServer:
             with db.connect() as conn:
                 goals=conn.execute("SELECT * FROM finance_goals ORDER BY id DESC").fetchall(); alerts=conn.execute("SELECT * FROM alerts ORDER BY id DESC").fetchall()
             return {"goals":_rows(goals),"alerts":_rows(alerts)}
-        if name == "provider_integration_status": return {"kite":{"state":"unconfigured","policy":"read-only; discovered transport required"},"upstox":{"state":"unconfigured","policy":"read-only; discovered transport required"},"indmoney":{"state":"read-only","policy":"manual/MCP handoff only"}}
+        if name in {"provider_mcp_status", "provider_integration_status"}:
+            with db.connect() as conn:
+                runs = conn.execute("SELECT broker_id,account_id,provider,status,finished_at,error_json FROM provider_sync_runs ORDER BY id DESC LIMIT 50").fetchall()
+            latest = {}
+            for row in runs:
+                key = (row["broker_id"], row["account_id"])
+                if key not in latest: latest[key] = dict(row)
+            providers = [{"broker_id": k[0], "account_id": k[1], "provider": v["provider"], "state": "connected" if v["status"] == "succeeded" else v["status"], "policy": "mcp_only read-only", "last_sync_status": v["status"], "last_sync": v["finished_at"], "error": redact(json.loads(v["error_json"] or "{}"))} for k, v in latest.items()]
+            return {"providers": providers, "mode": "mcp_only", "live_writes": False} if name == "provider_mcp_status" else (providers or {"state": "unconfigured", "policy": "mcp_only read-only; authorization and verified discovery required"})
+        if name == "provider_mcp_snapshot":
+            broker_id, account_id = str(args.get("broker_id", "")), str(args.get("account_id", ""))
+            if broker_id not in {"kite", "upstox", "indmoney"} or not account_id: raise PermissionError("invalid provider snapshot scope")
+            return {"broker_id": broker_id, "account_id": account_id, "holdings": _rows(db.list_provider_holdings(broker_id=broker_id, account_id=account_id)), "cash": _rows(db.list_provider_cash(broker_id=broker_id, account_id=account_id)), "orders": _rows(db.list_provider_orders(broker_id=broker_id, account_id=account_id)), "fills": _rows(db.list_provider_fills(broker_id=broker_id, account_id=account_id)), "source": "verified_mcp_persisted_snapshot", "live_writes": False}
         if name == "promotion_gate_status": return PromotionGates(db).status()
         if name == "paper_proposal_create":
             payload = {k:args.get(k) for k in ("symbol","side","quantity","portfolio_id","account_id")}; payload["mode"]="paper"; payload["created_at"]=datetime.now(timezone.utc).isoformat()
