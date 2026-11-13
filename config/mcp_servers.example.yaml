@@ -1,37 +1,36 @@
-# Example native MCP configuration for Hermes Agent.
-# Copy the mcp_servers block into ~/.hermes/config.yaml after reviewing
-# each provider's current authorization and tool list. Never commit tokens.
-#
-# The portfolio-tracker UI can manage local holdings/settings through its
-# CRUD API. Remote broker mutations must still pass the execution gateway.
-
+# Credential-free Hermes Agent example. Do not add secrets to this file.
+# The local app endpoint is callable only with an operator session or
+# PORTFOLIO_MCP_API_TOKEN configured at runtime.
 mcp_servers:
-  kite:
-    url: "https://mcp.kite.trade/mcp"
-    timeout: 180
-    connect_timeout: 60
+  portfolio_tracker:
+    url: "http://127.0.0.1:5055/mcp"
+    timeout: 30
+    connect_timeout: 5
+    headers: {}
     sampling:
       enabled: false
     policy:
-      read: [profile, funds, holdings, positions, orders, market_data]
-      write: [paper_gateway_only]
+      status: configured_endpoint_requires_runtime_auth
+      capabilities: [health, portfolio_read, paper_proposals, paper_orders, promotion_gates]
+      live_orders: disabled
+
+  kite:
+    url: "# configure only after discovering and verifying an authorized provider MCP transport"
+    policy:
+      status: unconfigured
+      capabilities: [read_only_after_discovery_and_reconciliation]
+      writes: disabled
 
   upstox:
-    url: "https://mcp.upstox.com/mcp"
-    timeout: 180
-    connect_timeout: 60
-    sampling:
-      enabled: false
+    url: "# configure only after discovering and verifying an authorized provider MCP transport"
     policy:
-      read: [profile, funds, holdings, positions, orders, market_data]
-      write: [paper_gateway_only]
+      status: unconfigured
+      capabilities: [read_only_after_discovery_and_reconciliation]
+      writes: disabled
 
   indmoney:
-    url: "https://mcp.indmoney.com/mcp"
-    timeout: 180
-    connect_timeout: 60
-    sampling:
-      enabled: false
+    url: "# manual/MCP handoff only; no local execution adapter"
     policy:
-      read: [us_holdings, portfolio]
-      write: [disabled]
+      status: read_only
+      capabilities: [manual_import, read_only_handoff]
+      writes: disabled

@@ -119,6 +119,10 @@ CREATE TABLE IF NOT EXISTS audit_events (
 CREATE INDEX IF NOT EXISTS idx_audit_events_entity ON audit_events(entity_type, entity_id, id);
 CREATE TRIGGER IF NOT EXISTS audit_events_no_update BEFORE UPDATE ON audit_events BEGIN SELECT RAISE(ABORT, 'audit_events is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS audit_events_no_delete BEFORE DELETE ON audit_events BEGIN SELECT RAISE(ABORT, 'audit_events is append-only'); END;
+CREATE TABLE IF NOT EXISTS promotion_gates (
+    gate_key TEXT PRIMARY KEY, label TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('unknown','pass','fail')),
+    evidence TEXT NOT NULL DEFAULT '', reviewer TEXT NOT NULL DEFAULT '', reviewed_at TEXT, updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS paper_holdings (
     broker_id TEXT NOT NULL DEFAULT 'paper', account_id TEXT NOT NULL DEFAULT '', portfolio TEXT NOT NULL, symbol TEXT NOT NULL, currency TEXT NOT NULL,
     shares TEXT NOT NULL CHECK (length(shares) > 0), avg_cost TEXT NOT NULL CHECK (length(avg_cost) > 0),

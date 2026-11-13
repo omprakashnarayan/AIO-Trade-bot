@@ -22,6 +22,8 @@ from .risk import RiskEngine, RiskLimits
 from .strategies import MarketFact, PortfolioFact, StrategyInputError, propose_kite_short_term, propose_upstox_long_term, propose_indmoney_us_tracking
 from .trading_models import ExecutionMode, OrderIntent, OrderSide, OrderType, TimeInForce
 from .provider_data import ProviderSyncService
+from .promotion_gates import PromotionGates
+from .mcp_server import MCPServer, token_valid, redact
 from .ledger import FinancialEvent, calculate, export_data, import_rows
 from .market_data import MarketDataService, BenchmarkSnapshot, _now
 from .analytics import portfolio_analytics
@@ -67,7 +69,7 @@ LOGIN_TEMPLATE = """<!doctype html><title>Portfolio Tracker login</title><h1>Ope
 def operator_guard():
     if not _request_allowed():
         return jsonify({"error": "request source is outside the configured LAN allowlist"}), 403
-    if request.endpoint in {"setup", "login", "health"}:
+    if request.endpoint in {"setup", "login", "health", "mcp_endpoint"}:
         return None
     if not _credentials_configured():
         if request.path.startswith("/api/"):
@@ -1078,3 +1080,36 @@ def main(host: str = "127.0.0.1", port: int = 5055, debug: bool = False):
 
 if __name__ == "__main__":
     main()
+
+# Phase 6: durable promotion-gate API and local MCP Streamable HTTP endpoint.
+@app.get("/api/promotion-gates")
+def api_promotion_gates():
+    return jsonify(PromotionGates(Database()).status())
+
+@app.post("/api/promotion-gates/<gate_key>")
+def api_record_promotion_gate(gate_key: str):
+    payload = _payload()
+    if not _csrf_ok():
+        return jsonify({"error": "CSRF token required"}), 403
+    try:
+        gate = PromotionGates(Database()).record(gate_key, status=str(payload.get("status", "unknown")), evidence=str(payload.get("evidence", "")), reviewer=str(payload.get("reviewer", "")), reviewed_at=payload.get("reviewed_at"), actor=str(session.get("operator_authenticated")))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify(gate)
+
+@app.get("/promotion-gates")
+def promotion_gates_page():
+    state = PromotionGates(Database()).status()
+    rows = "".join(f"<tr><td>{g['label']}</td><td>{g['status']}</td><td>{g.get('reviewer','')}</td><td>{g.get('reviewed_at') or ''}</td></tr>" for g in state["gates"])
+    return render_template_string("<h1>Phase 6 promotion gates</h1><p>Ready: {{ ready }}</p><table><tr><th>Gate</th><th>Status</th><th>Reviewer</th><th>Timestamp</th></tr>" + rows + "</table>", ready=state["ready"])
+
+@app.post("/mcp")
+def mcp_endpoint():
+    if not token_valid(request) and not session.get("operator_authenticated"):
+        return jsonify({"jsonrpc":"2.0", "id": (request.get_json(silent=True) or {}).get("id"), "error":{"code":-32001,"message":"MCP authentication required"}}), 401
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict) or payload.get("jsonrpc") != "2.0":
+        return jsonify({"error":"JSON-RPC 2.0 request required"}), 400
+    response = MCPServer().rpc(payload, actor="mcp-token" if token_valid(request) else "operator-session")
+    if response is None: return ("", 202)
+    return jsonify(redact(response))

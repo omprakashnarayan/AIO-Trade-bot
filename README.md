@@ -164,3 +164,20 @@ Do not enter OAuth secrets over plain LAN HTTP. Put the console behind HTTPS (fo
 Kite access tokens expire daily; Upstox expiry is shown when returned by the provider. The app exposes connected status, last authorization time, expiry, and capabilities honestly. Tokens are limited to read/status/reconciliation boundaries; live order writes remain disabled. INDmoney has no trading integration here: its Connect button is an official MCP handoff to `https://mcp.indmoney.com/mcp`, where sign-in and consent occur in an MCP-capable client. This app leaves INDmoney unconnected until separately verified and rejects all INDmoney write attempts.
 
 Future LIVE proposals can be placed in the append-only approval queue through `/api/approvals` and reviewed in Audit/Risk. Approval is recorded and audited, but it does not enable execution: LIVE submission remains rejected by the gateway.
+
+## Phase 6 readiness and MCP
+
+Phase 6 is a promotion-gate workspace, not live enablement. The durable checklist is available at `/promotion-gates` and `/api/promotion-gates`; record evidence with an authenticated session and `X-CSRF-Token`. All twelve gates must be `pass` before the checklist reports ready: paper soak, sandbox test, provider reconciliation, fault injection, kill switch, duplicate-order, token expiry, partial fill, human approval, separate credentials, per-order approval, and manual recovery. `ExecutionGateway` independently rejects every `ExecutionMode.LIVE` intent regardless of UI state.
+
+The local app MCP endpoint is `POST /mcp`. It implements JSON-RPC `initialize`, `tools/list`, `tools/call`, `resources/list`, and `resources/read`. Configure `PORTFOLIO_MCP_API_TOKEN` at runtime or use an authenticated operator session; no token is checked in. The available tools are read/status surfaces plus paper proposal and paper order tools. There is no live-order tool, arbitrary command tool, or credential-returning tool. Use `config/mcp_servers.example.yaml` as the credential-free Hermes configuration example.
+
+Kite and Upstox bridges accept only discovered, schema-verified injectable transports. A provider is reported `unconfigured` until an authorized transport is supplied and a normalized snapshot reconciles successfully. INDmoney remains read-only/manual/MCP handoff.
+
+Exact verification:
+
+```bash
+.venv/bin/pytest -q
+.venv/bin/python -m compileall -q portfolio_tracker
+.venv/bin/python -m pytest -q tests
+ git diff --check
+```
