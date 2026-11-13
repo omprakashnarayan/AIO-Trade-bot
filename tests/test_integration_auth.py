@@ -40,7 +40,7 @@ def test_oauth_state_and_kite_exchange(monkeypatch, tmp_path):
     assert start.status_code == 302
     with c.session_transaction() as sess:
         started_at = sess["oauth_state"]["started_at"]
-    monkeypatch.setattr(integration_auth, "_post_form", lambda url, form, **kwargs: {"access_token": "access", "expires_in": 3600})
+    monkeypatch.setattr(integration_auth, "_post_form", lambda url, form, **kwargs: {"status": "success", "data": {"access_token": "access", "expires_in": 3600}})
     # Kite's callback omits OAuth state; the authenticated browser session and
     # short start window bind the one-time request token instead.
     done = c.get("/oauth/kite/callback?request_token=req")

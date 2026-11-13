@@ -159,18 +159,21 @@ def exchange_code(secret_key: str | bytes, provider: str, code: str) -> dict[str
         payload = _post_form("https://api.upstox.com/v2/login/authorization/token", {"code": code, "client_id": record["client_id"], "client_secret": record["client_secret"], "redirect_uri": record["redirect_uri"], "grant_type": "authorization_code"})
     else:
         raise ValueError("INDmoney does not support this OAuth callback")
-    access_token = payload.get("access_token")
+    data = payload.get("data", payload)
+    if not isinstance(data, dict):
+        raise ValueError("provider rejected token exchange: malformed response data")
+    access_token = data.get("access_token")
     if not access_token:
         provider_message = str(payload.get("message") or payload.get("error_type") or payload.get("error") or "no access token returned")
         raise ValueError(f"provider rejected token exchange: {provider_message[:180]}")
-    data = _load(secret_key)
-    saved = data.setdefault("providers", {}).setdefault(provider, {})
+    stored = _load(secret_key)
+    saved = stored.setdefault("providers", {}).setdefault(provider, {})
     for key in ("access_token", "refresh_token", "token_type"):
-        if payload.get(key):
-            saved[key] = payload[key]
+        if data.get(key):
+            saved[key] = data[key]
     saved["last_authorized_at"] = _now()
-    saved["expires_at"] = _expiry(payload.get("expires_in"))
-    _save(secret_key, data)
+    saved["expires_at"] = _expiry(payload.get("expires_in") or data.get("expires_in"))
+    _save(secret_key, stored)
     return status(secret_key, provider)
 
 
