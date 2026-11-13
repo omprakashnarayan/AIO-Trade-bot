@@ -827,8 +827,15 @@ def oauth_callback(name: str):
     try:
         integration_auth.exchange_code(_integration_secret_key(), name, code)
     except (KeyError, ValueError, RuntimeError, OSError) as exc:
-        detail = str(exc)[:220] if isinstance(exc, RuntimeError) else "provider configuration or token exchange failed"
-        return jsonify({"error": "provider token exchange failed", "detail": detail}), 400
+        if isinstance(exc, RuntimeError):
+            detail = str(exc)[:220]
+        elif isinstance(exc, KeyError):
+            detail = f"missing provider configuration field: {str(exc.args[0])[:80] if exc.args else 'unknown'}"
+        elif isinstance(exc, ValueError):
+            detail = f"invalid provider response or configuration: {str(exc)[:160]}"
+        else:
+            detail = "provider network error"
+        return jsonify({"error": "provider token exchange failed", "detail": redact(detail)}), 400
     return redirect(url_for("operator_page", section="integrations"))
 
 
