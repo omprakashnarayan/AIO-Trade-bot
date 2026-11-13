@@ -8,6 +8,7 @@ import secrets
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
+from urllib.parse import urlparse
 
 from flask import Flask, jsonify, redirect, render_template_string, request, session, url_for
 from werkzeug.security import check_password_hash
@@ -52,6 +53,9 @@ def security_headers(response):
     response.headers.setdefault("Referrer-Policy", "no-referrer")
     response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
     response.headers.setdefault("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
+    if request.endpoint not in {"health", "setup", "login"}:
+        response.headers.setdefault("Cache-Control", "private, no-store, max-age=0")
+        response.headers.setdefault("Vary", "Cookie")
     forwarded_proto = request.headers.get("X-Forwarded-Proto", "").split(",", 1)[0].strip().lower()
     if os.environ.get("PORTFOLIO_PUBLIC_HTTPS", "0") == "1" and (request.is_secure or forwarded_proto == "https"):
         response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
@@ -175,7 +179,16 @@ def _csrf_token() -> str:
 def _csrf_ok() -> bool:
     supplied = request.headers.get("X-CSRF-Token") or request.form.get("csrf_token") or (_payload().get("csrf_token") if request.is_json else None)
     expected = session.get("csrf_token")
-    return bool(expected and supplied and secrets.compare_digest(str(expected), str(supplied)))
+    if expected and supplied and secrets.compare_digest(str(expected), str(supplied)):
+        return True
+    # Same-origin fallback protects against stale cached forms while retaining
+    # session authentication and rejecting cross-site form submissions.
+    source = request.headers.get("Origin") or request.headers.get("Referer")
+    if not source or not session.get("operator_authenticated"):
+        return False
+    parsed = urlparse(source)
+    host = (request.host or "").split(":", 1)[0].lower()
+    return parsed.scheme in {"http", "https"} and parsed.hostname and parsed.hostname.lower() == host
 
 
 def _integration_secret_key() -> str:
