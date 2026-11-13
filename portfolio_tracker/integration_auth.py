@@ -161,7 +161,8 @@ def exchange_code(secret_key: str | bytes, provider: str, code: str) -> dict[str
         raise ValueError("INDmoney does not support this OAuth callback")
     access_token = payload.get("access_token")
     if not access_token:
-        raise ValueError("provider callback did not return an access token")
+        provider_message = str(payload.get("message") or payload.get("error_type") or payload.get("error") or "no access token returned")
+        raise ValueError(f"provider rejected token exchange: {provider_message[:180]}")
     data = _load(secret_key)
     saved = data.setdefault("providers", {}).setdefault(provider, {})
     for key in ("access_token", "refresh_token", "token_type"):
