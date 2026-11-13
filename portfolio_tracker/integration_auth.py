@@ -6,6 +6,7 @@ import json
 import os
 import secrets
 import stat
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -136,8 +137,16 @@ def _post_form(url: str, form: dict[str, str], *, headers: dict[str, str] | None
     body = urllib.parse.urlencode(form).encode()
     request_headers = {"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json", **(headers or {})}
     req = urllib.request.Request(url, data=body, headers=request_headers, method="POST")
-    with urllib.request.urlopen(req, timeout=20) as response:
-        return json.loads(response.read().decode())
+    try:
+        with urllib.request.urlopen(req, timeout=20) as response:
+            return json.loads(response.read().decode())
+    except urllib.error.HTTPError as exc:
+        try:
+            body = json.loads(exc.read().decode())
+            message = str(body.get("message") or body.get("error_type") or "provider rejected request")
+        except (OSError, ValueError, TypeError):
+            message = "provider rejected request"
+        raise RuntimeError(f"provider rejected token exchange: {message[:180]}") from None
 
 
 def exchange_code(secret_key: str | bytes, provider: str, code: str) -> dict[str, Any]:

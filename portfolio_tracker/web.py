@@ -826,8 +826,9 @@ def oauth_callback(name: str):
         return jsonify({"error": "provider callback code is missing"}), 400
     try:
         integration_auth.exchange_code(_integration_secret_key(), name, code)
-    except (KeyError, ValueError, RuntimeError, OSError):
-        return jsonify({"error": "provider token exchange failed"}), 400
+    except (KeyError, ValueError, RuntimeError, OSError) as exc:
+        detail = str(exc)[:220] if isinstance(exc, RuntimeError) else "provider configuration or token exchange failed"
+        return jsonify({"error": "provider token exchange failed", "detail": detail}), 400
     return redirect(url_for("operator_page", section="integrations"))
 
 
