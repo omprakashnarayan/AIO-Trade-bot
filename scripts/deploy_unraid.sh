@@ -13,11 +13,20 @@ ALLOWED_CIDRS="${PORTFOLIO_ALLOWED_CIDRS:-192.168.200.0/24,127.0.0.1/32}"
 MCP_API_TOKEN="${PORTFOLIO_MCP_API_TOKEN:-}"
 PUBLIC_HTTPS="${PORTFOLIO_PUBLIC_HTTPS:-1}"
 TRUSTED_HOSTS="${PORTFOLIO_TRUSTED_HOSTS:-findash.deepsort.in,192.168.200.196,127.0.0.1,localhost}"
+SESSION_SECRET_FILE="${PORTFOLIO_SESSION_SECRET_FILE:-/mnt/user/personalfiles/work/portfolio-tracker-session-secret}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 cd "$ROOT_DIR"
 mkdir -p "$APPDATA_DIR"
-
+if [ -z "$SESSION_SECRET" ]; then
+  mkdir -p "$(dirname "$SESSION_SECRET_FILE")"
+  if [ ! -s "$SESSION_SECRET_FILE" ]; then
+    umask 077
+    openssl rand -hex 32 > "$SESSION_SECRET_FILE"
+  fi
+  chmod 600 "$SESSION_SECRET_FILE"
+  SESSION_SECRET="$(tr -d '\n' < "$SESSION_SECRET_FILE")"
+fi
 echo "Building $IMAGE..."
 docker build -t "$IMAGE" .
 
