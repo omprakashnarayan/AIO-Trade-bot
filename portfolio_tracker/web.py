@@ -34,6 +34,28 @@ from .brokers.upstox import UpstoxAdapter, UpstoxConfig
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("PORTFOLIO_SESSION_SECRET") or secrets.token_hex(32)
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.environ.get("PORTFOLIO_PUBLIC_HTTPS", "0") == "1",
+    MAX_CONTENT_LENGTH=2 * 1024 * 1024,
+)
+_trusted_hosts = [item.strip() for item in os.environ.get("PORTFOLIO_TRUSTED_HOSTS", "").split(",") if item.strip()]
+if _trusted_hosts:
+    app.config["TRUSTED_HOSTS"] = _trusted_hosts
+
+
+@app.after_request
+def security_headers(response):
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    response.headers.setdefault("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
+    forwarded_proto = request.headers.get("X-Forwarded-Proto", "").split(",", 1)[0].strip().lower()
+    if os.environ.get("PORTFOLIO_PUBLIC_HTTPS", "0") == "1" and (request.is_secure or forwarded_proto == "https"):
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    return response
 
 
 def _allowed_networks() -> tuple[ipaddress._BaseNetwork, ...]:
