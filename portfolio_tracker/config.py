@@ -31,7 +31,7 @@ DEFAULT_SETTINGS = {
 # the mode is mcp_only; authorization is performed by the provider in a browser.
 OFFICIAL_MCP_ENDPOINTS = {
     "kite": {"url": "https://mcp.kite.trade/mcp", "read_only": True},
-    # Upstox endpoint is intentionally absent until verified from official docs.
+    "upstox": {"url": "https://mcp.upstox.com/mcp", "read_only": True},
     "indmoney": {"url": "https://mcp.indmoney.com/mcp", "read_only": True},
 }
 

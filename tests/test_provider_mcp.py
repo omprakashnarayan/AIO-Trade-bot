@@ -44,3 +44,4 @@ def test_mcp_auth_failure_and_redaction():
     assert "secret-value" not in str(redact("Bearer secret-value"))
     assert DEFAULT_SETTINGS["provider_modes"]["kite"] == "mcp_only"
     assert OFFICIAL_MCP_ENDPOINTS["kite"]["url"] == "https://mcp.kite.trade/mcp"
+    assert OFFICIAL_MCP_ENDPOINTS["upstox"]["url"] == "https://mcp.upstox.com/mcp"
