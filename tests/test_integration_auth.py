@@ -39,10 +39,11 @@ def test_oauth_state_and_kite_exchange(monkeypatch, tmp_path):
     start = c.post("/api/integrations/kite/connect", headers={"X-CSRF-Token": token})
     assert start.status_code == 302
     with c.session_transaction() as sess:
-        state = sess["oauth_state"]["value"]
+        started_at = sess["oauth_state"]["started_at"]
     monkeypatch.setattr(integration_auth, "_post_form", lambda url, form: {"access_token": "access", "expires_in": 3600})
-    assert c.get("/oauth/kite/callback?state=wrong&request_token=req").status_code == 400
-    done = c.get(f"/oauth/kite/callback?state={state}&request_token=req")
+    # Kite's callback omits OAuth state; the authenticated browser session and
+    # short start window bind the one-time request token instead.
+    done = c.get("/oauth/kite/callback?request_token=req")
     assert done.status_code == 302
     status = c.get("/api/integrations").get_json()["integrations"]["kite"]
     assert status["connected"] is True

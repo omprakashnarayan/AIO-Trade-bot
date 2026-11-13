@@ -794,7 +794,7 @@ def integration_start(name: str):
         return jsonify({"error": "CSRF validation failed"}), 403
     try:
         state = secrets.token_urlsafe(32)
-        session["oauth_state"] = {"provider": name, "value": state}
+        session["oauth_state"] = {"provider": name, "value": state, "started_at": datetime.now(timezone.utc).isoformat()}
         return redirect(integration_auth.authorization_url(_integration_secret_key(), name, state))
     except (KeyError, ValueError, RuntimeError) as exc:
         return jsonify({"error": str(exc)}), 400
@@ -805,7 +805,18 @@ def oauth_callback(name: str):
     if name not in {"kite", "upstox"}:
         return jsonify({"error": "unknown OAuth provider"}), 404
     expected = session.get("oauth_state") or {}
-    if not expected or expected.get("provider") != name or not request.args.get("state") or not secrets.compare_digest(str(expected.get("value")), str(request.args.get("state"))):
+    if not expected or expected.get("provider") != name:
+        return jsonify({"error": "invalid or expired OAuth state"}), 400
+    if name == "kite":
+        # Kite's callback does not return OAuth state; bind the one-time request
+        # token to the same authenticated browser session and a short window.
+        try:
+            started = datetime.fromisoformat(str(expected.get("started_at")))
+            if (datetime.now(timezone.utc) - started).total_seconds() > 600:
+                raise ValueError
+        except (TypeError, ValueError):
+            return jsonify({"error": "invalid or expired OAuth state"}), 400
+    elif not request.args.get("state") or not secrets.compare_digest(str(expected.get("value")), str(request.args.get("state"))):
         return jsonify({"error": "invalid or expired OAuth state"}), 400
     session.pop("oauth_state", None)
     if request.args.get("error"):
