@@ -803,11 +803,11 @@ def integration_start(name: str):
         return jsonify({"error": "unknown integration"}), 404
     if load_settings().get("provider_modes", {}).get(name, "mcp_only") == "mcp_only":
         endpoint = OFFICIAL_MCP_ENDPOINTS.get(name)
-        # Preserve historical OAuth status/route for already-configured app
-        # credentials, but this path is never used by MCP-only synchronization.
-        record = integration_auth.get_provider(_integration_secret_key(), name)
-        if endpoint and not (record.get("api_key") or record.get("client_id")):
+        # MCP-only is strict: never route a provider connection through the
+        # legacy REST/API OAuth flow, even when historical credentials exist.
+        if endpoint:
             return redirect(endpoint["url"])
+        return jsonify({"error": f"{name} MCP endpoint is not configured"}), 503
     if request.method == "POST" and not _csrf_ok():
         return jsonify({"error": "CSRF validation failed"}), 403
     try:

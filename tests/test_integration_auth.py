@@ -32,7 +32,13 @@ def test_config_requires_csrf_and_redacts_secrets(monkeypatch, tmp_path):
     assert "kite-secret" not in raw
 
 
+def legacy_provider_mode(monkeypatch):
+    original = web.load_settings
+    monkeypatch.setattr(web, "load_settings", lambda: {**original(), "provider_modes": {"kite": "legacy", "upstox": "legacy", "indmoney": "mcp_only"}})
+
+
 def test_oauth_state_and_kite_exchange(monkeypatch, tmp_path):
+    legacy_provider_mode(monkeypatch)
     c = client(monkeypatch, tmp_path)
     token = csrf(c)
     c.post("/api/integrations/kite/config", json={"api_key": "key", "api_secret": "secret", "redirect_uri": "https://example.test/oauth/kite/callback"}, headers={"X-CSRF-Token": token})
@@ -52,6 +58,7 @@ def test_oauth_state_and_kite_exchange(monkeypatch, tmp_path):
 
 
 def test_expired_callback_and_disconnect(monkeypatch, tmp_path):
+    legacy_provider_mode(monkeypatch)
     c = client(monkeypatch, tmp_path)
     token = csrf(c)
     c.post("/api/integrations/upstox/config", json={"client_id": "id", "client_secret": "secret", "redirect_uri": "https://example.test/oauth/upstox/callback"}, headers={"X-CSRF-Token": token})
