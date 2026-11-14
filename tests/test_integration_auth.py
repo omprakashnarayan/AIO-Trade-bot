@@ -32,47 +32,21 @@ def test_config_requires_csrf_and_redacts_secrets(monkeypatch, tmp_path):
     assert "kite-secret" not in raw
 
 
-def legacy_provider_mode(monkeypatch):
-    original = web.load_settings
-    monkeypatch.setattr(web, "load_settings", lambda: {**original(), "provider_modes": {"kite": "legacy", "upstox": "legacy", "indmoney": "mcp_only"}})
-
-
-def test_oauth_state_and_kite_exchange(monkeypatch, tmp_path):
-    legacy_provider_mode(monkeypatch)
+def test_mcp_connect_never_starts_legacy_oauth(monkeypatch, tmp_path):
     c = client(monkeypatch, tmp_path)
     token = csrf(c)
-    c.post("/api/integrations/kite/config", json={"api_key": "key", "api_secret": "secret", "redirect_uri": "https://example.test/oauth/kite/callback"}, headers={"X-CSRF-Token": token})
-    start = c.post("/api/integrations/kite/connect", headers={"X-CSRF-Token": token})
-    assert start.status_code == 302
+    response = c.post("/api/integrations/kite/connect", headers={"X-CSRF-Token": token})
+    assert response.status_code == 409
+    assert response.get_json()["status"] == "authorization_required"
+    assert response.get_json()["mcp_endpoint"] == "https://mcp.kite.trade/mcp"
     with c.session_transaction() as sess:
-        started_at = sess["oauth_state"]["started_at"]
-    monkeypatch.setattr(integration_auth, "_post_form", lambda url, form, **kwargs: {"status": "success", "data": {"access_token": "access", "expires_in": 3600}})
-    # Kite's callback omits OAuth state; the authenticated browser session and
-    # short start window bind the one-time request token instead.
-    done = c.get("/oauth/kite/callback?request_token=req")
-    assert done.status_code == 302
-    status = c.get("/api/integrations").get_json()["integrations"]["kite"]
-    assert status["connected"] is True
-    assert status["last_authorized_at"]
-    assert "access" not in c.get("/api/integrations").get_data(as_text=True)
+        assert "oauth_state" not in sess
 
 
-def test_expired_callback_and_disconnect(monkeypatch, tmp_path):
-    legacy_provider_mode(monkeypatch)
+def test_mcp_callback_requires_authorization_state_and_disconnect(monkeypatch, tmp_path):
     c = client(monkeypatch, tmp_path)
+    assert c.get("/oauth/upstox/callback?code=code").status_code == 400
     token = csrf(c)
-    c.post("/api/integrations/upstox/config", json={"client_id": "id", "client_secret": "secret", "redirect_uri": "https://example.test/oauth/upstox/callback"}, headers={"X-CSRF-Token": token})
-    c.post("/api/integrations/upstox/connect", headers={"X-CSRF-Token": token})
-    with c.session_transaction() as sess:
-        state = sess["oauth_state"]["value"]
-    monkeypatch.setattr(integration_auth, "_post_form", lambda url, form, **kwargs: {"access_token": "access", "expires_in": 1})
-    assert c.get(f"/oauth/upstox/callback?state={state}&code=code").status_code == 302
-    record = integration_auth.get_provider(str(web.app.secret_key), "upstox")
-    record["expires_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
-    data = integration_auth._load(str(web.app.secret_key))
-    data["providers"]["upstox"] = record
-    integration_auth._save(str(web.app.secret_key), data)
-    assert c.get("/api/integrations").get_json()["integrations"]["upstox"]["connected"] is False
     assert c.post("/api/integrations/upstox/disconnect", headers={"X-CSRF-Token": token}).status_code == 200
 
 
