@@ -121,18 +121,37 @@ def _post_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def fetch_metadata(endpoint: str, *, metadata_url: str | None = None, opener=None) -> dict[str, Any]:
-    url = metadata_url or endpoint.rstrip("/") + "/.well-known/oauth-authorization-server"
-    req = urllib.request.Request(url, headers={"Accept": "application/json"})
-    try:
-        with (opener or urllib.request).urlopen(req, timeout=10) as response:
-            payload = json.loads(response.read().decode())
-        if not isinstance(payload, dict) or not payload.get("authorization_endpoint") or not payload.get("token_endpoint"):
-            raise RuntimeError("OAuth metadata is incomplete")
-        return payload
-    except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"OAuth metadata unavailable (HTTP {exc.code}); authorization URL must be configured") from None
-    except (urllib.error.URLError, OSError, ValueError):
-        raise RuntimeError("OAuth metadata unavailable; authorization URL must be configured") from None
+    client = opener or urllib.request
+    base = endpoint.rstrip("/")
+    candidates = [metadata_url] if metadata_url else [base + "/.well-known/oauth-protected-resource", base + "/.well-known/oauth-authorization-server"]
+    last_error = None
+    for url in candidates:
+        if not url: continue
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        try:
+            with client.urlopen(req, timeout=10) as response:
+                payload = json.loads(response.read().decode())
+            if not isinstance(payload, dict): raise RuntimeError("OAuth metadata is invalid")
+            if payload.get("authorization_endpoint") and payload.get("token_endpoint"):
+                return payload
+            servers = payload.get("authorization_servers") or []
+            issuer = str(servers[0]).rstrip("/") if servers else ""
+            if issuer:
+                auth_candidates = [issuer + "/.well-known/oauth-authorization-server", issuer + "/.well-known/openid-configuration"]
+                for auth_url in auth_candidates:
+                    try:
+                        with client.urlopen(urllib.request.Request(auth_url, headers={"Accept": "application/json"}), timeout=10) as auth_response:
+                            auth_payload = json.loads(auth_response.read().decode())
+                        if isinstance(auth_payload, dict) and auth_payload.get("authorization_endpoint") and auth_payload.get("token_endpoint"):
+                            return {**auth_payload, "scopes_supported": payload.get("scopes_supported", auth_payload.get("scopes_supported"))}
+                    except (urllib.error.HTTPError, urllib.error.URLError, OSError, ValueError):
+                        continue
+            last_error = "OAuth metadata is incomplete"
+        except urllib.error.HTTPError as exc:
+            last_error = f"OAuth metadata unavailable (HTTP {exc.code})"
+        except (urllib.error.URLError, OSError, ValueError):
+            last_error = "OAuth metadata unavailable"
+    raise RuntimeError(f"{last_error or 'OAuth metadata unavailable'}; authorization URL must be configured")
 
 
 def _pkce() -> tuple[str, str]:
