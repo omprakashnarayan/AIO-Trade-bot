@@ -1,5 +1,7 @@
 # Credential-free MCP configuration example. Do not add secrets.
-# Provider reads use MCP only. OAuth/API credentials are not used for sync.
+# Provider reads use MCP only. Browser OAuth/PKCE is performed by the app.
+# If metadata is unavailable (HTTP 403), configure an official documented
+# authorization URL via MCP_<PROVIDER>_OAUTH_AUTHORIZATION_URL.
 mcp_servers:
   portfolio_tracker:
     url: "http://127.0.0.1:5055/mcp"

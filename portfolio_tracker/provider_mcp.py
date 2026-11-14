@@ -46,12 +46,14 @@ class MCPAuthorizationRequired(BrokerAdapterError):
 class MCPClient:
     """Small standards-compliant Streamable HTTP JSON-RPC MCP client."""
     def __init__(self, url: str, *, provider: str, timeout: float = 30.0, connect_timeout: float = 5.0,
-                 authorization_url: str | None = None, opener=None):
+                 authorization_url: str | None = None, access_token: str | None = None,
+                 token_type: str = "Bearer", token_provider=None, opener=None):
         if not url.startswith("https://") and not url.startswith("http://"):
             raise ValueError("MCP endpoint must be an HTTP(S) URL")
         self.url, self.provider = url, provider
         self.timeout, self.connect_timeout = float(timeout), float(connect_timeout)
         self.authorization_url = authorization_url or url
+        self.access_token, self.token_type, self.token_provider = access_token, token_type, token_provider
         self._opener = opener or urllib.request.build_opener()
         self._next_id = 0
         self._session_id: str | None = None
@@ -71,6 +73,9 @@ class MCPClient:
         if request_id is not None: payload["id"] = request_id
         if params is not None: payload["params"] = dict(params)
         headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+        token = self.token_provider() if self.token_provider else self.access_token
+        if token:
+            headers["Authorization"] = f"{self.token_type} {token}"
         if self._session_id: headers["MCP-Session-Id"] = self._session_id
         req = urllib.request.Request(self.url, data=json.dumps(payload).encode(), headers=headers, method="POST")
         try:

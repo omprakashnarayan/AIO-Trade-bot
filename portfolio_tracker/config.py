@@ -35,6 +35,17 @@ OFFICIAL_MCP_ENDPOINTS = {
     "indmoney": {"url": "https://mcp.indmoney.com/mcp", "read_only": True},
 }
 
+# Optional provider-declared OAuth metadata overrides.  These are configuration
+# hooks, not guessed endpoints; leave unset when the hosted server publishes
+# metadata itself.  Authorization URLs are only used for an honest handoff when
+# metadata discovery is forbidden (for example HTTP 403).
+def oauth_provider_config(provider: str) -> dict[str, str | None]:
+    prefix = provider.upper()
+    return {
+        "metadata_url": os.environ.get(f"MCP_{prefix}_OAUTH_METADATA_URL") or None,
+        "authorization_url": os.environ.get(f"MCP_{prefix}_OAUTH_AUTHORIZATION_URL") or None,
+    }
+
 
 
 def ensure_dirs() -> None:

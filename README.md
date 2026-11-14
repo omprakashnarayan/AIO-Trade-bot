@@ -143,10 +143,15 @@ PORTFOLIO_ADMIN_USERNAME=admin
 PORTFOLIO_ADMIN_PASSWORD_HASH=<output from the command above>
 PORTFOLIO_SESSION_SECRET=<random 32+ byte secret>
 PORTFOLIO_ALLOWED_CIDRS=192.168.200.0/24,127.0.0.1/32
-# Optional connector declarations only; this console makes no provider calls:
-KITE_MCP_ENDPOINT=
-UPSTOX_MCP_ENDPOINT=
-INDMONEY_MCP_ENDPOINT=
+# Optional OAuth metadata overrides for hosted MCP servers. Never put client
+# secrets or bearer tokens here; use a public client ID only when officially
+# documented, otherwise dynamic registration is attempted.
+MCP_KITE_OAUTH_METADATA_URL=
+MCP_KITE_OAUTH_AUTHORIZATION_URL=
+MCP_UPSTOX_OAUTH_METADATA_URL=
+MCP_UPSTOX_OAUTH_AUTHORIZATION_URL=
+MCP_INDMONEY_OAUTH_METADATA_URL=https://mcp.indmoney.com/.well-known/oauth-authorization-server
+MCP_INDMONEY_OAUTH_AUTHORIZATION_URL=
 ```
 
 All trading configuration—trading mode, risk limits, scheduler enabled state, default account/portfolio/currency, and strategy preferences—is changed from the authenticated Settings UI and persisted under `/data/settings.json`. It is not read from Docker environment variables. Docker environment variables are limited to deployment, authentication, network restriction, and connector declarations.
@@ -157,11 +162,9 @@ Open `http://<unraid-host>:5055/`, sign in, and use the navigation for Portfolio
 
 ### Browser-first provider authorization
 
-Configure and authorize Kite and Upstox only from the authenticated **Integrations** page. Enter the provider app identifiers, client/API secrets, and registered redirect URL; secrets are encrypted with a key derived from `PORTFOLIO_SESSION_SECRET`, stored under the `/data` application volume with restrictive permissions, and are never displayed or returned after saving. Use Connect/Reconnect to begin the provider's official browser OAuth flow, then let the callback perform the server-side token exchange. Disconnect revokes the locally stored token while retaining no token material. OAuth state is session-bound and CSRF-protected.
+Configure and authorize providers only from the authenticated Integrations page. The app uses OAuth Authorization Code + PKCE for hosted MCP servers, dynamically registers a public client when the server exposes `registration_endpoint`, and stores state, PKCE verifier, access tokens, refresh tokens, and expiry inside the encrypted integration store. The browser session binding is checked again at callback and MCP use. Do not enter API keys, API secrets, bearer tokens, or undocumented client secrets. If metadata returns 403, the app reports `authorization_required`; set `MCP_<PROVIDER>_OAUTH_AUTHORIZATION_URL` only to an official documented URL. Kite and Upstox are never routed through their REST/API OAuth flows.
 
-Do not enter OAuth secrets over plain LAN HTTP. Put the console behind HTTPS (for example, a Cloudflare Tunnel) before using the Integrations form, and only enter secrets in that HTTPS browser session. Never paste provider secrets into chat, logs, Docker files, or source control.
-
-Kite access tokens expire daily; Upstox expiry is shown when returned by the provider. The app exposes connected status, last authorization time, expiry, and capabilities honestly. Tokens are limited to read/status/reconciliation boundaries; live order writes remain disabled. INDmoney has no trading integration here: its Connect button is an official MCP handoff to `https://mcp.indmoney.com/mcp`, where sign-in and consent occur in an MCP-capable client. This app leaves INDmoney unconnected until separately verified and rejects all INDmoney write attempts.
+The MCP client injects `Authorization: Bearer ...` only from encrypted storage, refreshes an expired token through the advertised token endpoint when a refresh token exists, and never logs token material. A provider remains `authorized` rather than `connected` until a real MCP `initialize`, `tools/list`, and verified read sync succeed. Live writes remain disabled.
 
 Future LIVE proposals can be placed in the append-only approval queue through `/api/approvals` and reviewed in Audit/Risk. Approval is recorded and audited, but it does not enable execution: LIVE submission remains rejected by the gateway.
 
@@ -185,14 +188,10 @@ authorized MCP read succeeds.
 Verified hosted endpoints in this phase:
 
 - Kite: `https://mcp.kite.trade/mcp` (official Zerodha hosted MCP; read-only policy)
-- Upstox: unconfigured until an official MCP endpoint is verified (no guessed URL is used)
+- Upstox: `https://mcp.upstox.com/mcp` (official hosted MCP; read-only policy)
 - INDmoney: `https://mcp.indmoney.com/mcp` (read-only browser/client handoff; no writes)
 
-Authorization is browser-based at the provider MCP endpoint. Existing Kite
-OAuth/API status is preserved for historical visibility, but it is not used for
-MCP-only synchronization. The Integrations page exposes provider mode, endpoint,
-authorization handoff, discovered tools, reconnect, and sync status. Failures
-remain honest (`unconfigured`, `authorization_required`, or `error`).
+Authorization is browser-based through the hosted MCP OAuth metadata and PKCE flow. If Kite or Upstox metadata is unavailable with HTTP 403, the app does not guess an endpoint or client secret: it reports an honest authorization-required handoff and accepts only explicitly configured official documentation URLs. Existing REST/API credentials are ignored by MCP-only synchronization.
 
 The local app MCP endpoint exposes only broker MCP status and verified persisted
 snapshots in addition to existing local read/paper tools. It never returns

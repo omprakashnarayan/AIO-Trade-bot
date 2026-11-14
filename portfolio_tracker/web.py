@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 from flask import Flask, jsonify, redirect, render_template_string, request, session, url_for
 from werkzeug.security import check_password_hash
 
-from .config import DEFAULT_SETTINGS, OFFICIAL_MCP_ENDPOINTS, load_settings, save_settings
+from .config import DEFAULT_SETTINGS, OFFICIAL_MCP_ENDPOINTS, load_settings, save_settings, oauth_provider_config
 from .provider_mcp import MCPClient, MCPProviderAdapter, MCPAuthorizationRequired
 from .agents import AGENTS, list_agents, retry_agent, run_agent
 from . import integration_auth
@@ -128,7 +128,7 @@ def login():
         except (KeyError, ValueError):
             valid = False
         if valid:
-            session.clear(); session["operator_authenticated"] = True; session["csrf_token"] = secrets.token_urlsafe(32)
+            session.clear(); session["operator_authenticated"] = True; session["csrf_token"] = secrets.token_urlsafe(32); session["oauth_session_id"] = secrets.token_urlsafe(32)
             return redirect(request.args.get("next") or url_for("index"))
         error = "Invalid credentials"
     return render_template_string(LOGIN_TEMPLATE, error=error), 401 if error else 200
@@ -211,8 +211,8 @@ def _integration_status() -> dict[str, dict[str, Any]]:
         mode = load_settings().get("provider_modes", {}).get(name, "mcp_only")
         endpoint = OFFICIAL_MCP_ENDPOINTS.get(name)
         status.update({"mode": mode, "transport": "mcp" if mode == "mcp_only" else "rejected", "mcp_endpoint": endpoint["url"] if endpoint else None,
-                       "mcp_authorized": bool(record.get("mcp_authorized")), "discovered_tools": record.get("mcp_tools", []) if isinstance(record.get("mcp_tools", []), list) else [],
-                       "mcp_status": "connected" if record.get("mcp_authorized") else ("authorization_required" if endpoint else "unconfigured")})
+                       "mcp_authorized": bool(status.get("oauth_authorized")), "discovered_tools": status.get("discovered_tools", []),
+                       "mcp_status": "connected" if status.get("mcp_verified") else ("authorized" if status.get("oauth_authorized") else ("authorization_required" if endpoint else "unconfigured"))})
     return result
 
 
@@ -227,7 +227,13 @@ def _provider_adapter(name: str):
         raise ValueError(f"{name} MCP endpoint is unconfigured; no verified official endpoint is available")
     record = integration_auth.get_provider(_integration_secret_key(), name)
     account_id = str(record.get("account_id") or load_settings().get("default_account_id") or "operator")
-    client = MCPClient(endpoint["url"], provider=name, authorization_url=endpoint["url"])
+    session_id = str(session.get("oauth_session_id", ""))
+    record = integration_auth.get_provider(_integration_secret_key(), name)
+    def token_provider():
+        token_endpoint = record.get("token_endpoint")
+        refresh = (lambda refresh_token: integration_auth._post(token_endpoint, {"grant_type": "refresh_token", "refresh_token": refresh_token, "client_id": record.get("client_id", "")})) if token_endpoint else None
+        return integration_auth.access_token(_integration_secret_key(), name, session_id=session_id, refresh=refresh)
+    client = MCPClient(endpoint["url"], provider=name, authorization_url=oauth_provider_config(name).get("authorization_url") or endpoint["url"], token_provider=token_provider)
     return MCPProviderAdapter(provider=name, broker_id=name, account_id=account_id, client=client)
 
 
@@ -447,7 +453,7 @@ OPERATOR_PAGE_TEMPLATE = r'''
 {% elif section == 'analytics' %}<div class="grid"><div class="card span-12"><h2>PORTFOLIO ANALYTICS / WATCHLIST</h2><p class="muted">Verified or explicitly manual prices only. No sectors, fundamentals, or invented marks.</p><div id="analytics-state">Loading analytics; unavailable inputs remain unavailable.</div><p class="stale">QUOTE FRESHNESS: <a href="/api/market-data/status">inspect quote freshness</a> · BENCHMARK COMPARISON: <a href="/api/benchmarks">inspect benchmark snapshots</a></p><p class="warn">UNAVAILABLE states are shown when no configured provider or manual snapshot exists.</p></div></div>
 {% elif section == 'ledger' %}<div class="grid"><div class="card span-12"><h2>LEDGER / TAX SCOPE</h2><form method="get" action="/page/ledger" class="form-grid"><label>Namespace<select name="namespace"><option value="manual" {% if data.filters.namespace == 'manual' %}selected{% endif %}>manual</option><option value="broker" {% if data.filters.namespace == 'broker' %}selected{% endif %}>broker</option><option value="indmoney" {% if data.filters.namespace == 'indmoney' %}selected{% endif %}>indmoney</option><option value="paper" {% if data.filters.namespace == 'paper' %}selected{% endif %}>paper</option></select></label><label>Portfolio<input name="portfolio" value="{{ data.filters.portfolio or '' }}" placeholder="All portfolios"></label><label>Symbol<input name="symbol" value="{{ data.filters.symbol or '' }}" placeholder="All symbols"></label><label>As of date<input name="as_of" type="date" value="{{ data.filters.as_of or '' }}"></label><div class="actions"><button>Apply filters</button><a class="button" href="{{ data.export_json }}">Export JSON</a><a class="button" href="{{ data.export_csv }}">Export CSV</a></div></form><p class="muted">Namespace isolation is explicit. Source and provenance remain attached to each imported event.</p></div><div class="card span-6"><h2>TRANSACTION IMPORT</h2><form id="ledger-import" class="form-grid"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><label>Source<input name="source" value="operator-ui"></label><label>Namespace<select name="namespace"><option>manual</option><option>broker</option><option>indmoney</option><option>paper</option></select></label><label style="grid-column:1/-1">Rows JSON<textarea name="rows" required placeholder='[{"event_type":"buy","symbol":"INFY","quantity":"1","price":"100","event_date":"2026-01-01","source":"broker","external_id":"txn-1"}]'></textarea></label><div class="actions"><button type="button" id="ledger-preview">Preview import</button><button type="submit">Commit import</button></div></form><div id="ledger-result" class="status">Preview before commit. Commits are authenticated, CSRF-protected, append-only, and paper/local only.</div></div><div class="card span-6"><h2>FIFO / TAX SUMMARY</h2><div class="metric"><span>Realized P/L</span><b>{{ data.summary.realized_pl }}</b></div><div class="metric"><span>Unrealized P/L</span><b class="warn">UNAVAILABLE</b></div><p class="muted">Market prices are unavailable in this local ledger surface; unrealized P/L is not estimated.</p><div class="metric"><span>Income</span><b>{{ data.summary.income }}</b></div><div class="metric"><span>Fees</span><b>{{ data.summary.fees }}</b></div><div class="metric"><span>Taxes</span><b>{{ data.summary.taxes }}</b></div><p class="muted">Provenance: calculated from normalized ledger events, FIFO lots, and stored source fields.</p></div><div class="card span-12"><h2>OPEN FIFO LOTS</h2><div class="table-wrap"><table><thead><tr><th>SYMBOL</th><th>ACQUIRED</th><th>REMAINING</th><th>UNIT COST</th><th>CURRENCY</th><th>SOURCE</th></tr></thead><tbody>{% for lot in data.lots %}<tr><td class="symbol">{{ lot.symbol }}</td><td>{{ lot.date }}</td><td>{{ lot.remaining_quantity }}</td><td>{{ lot.unit_cost }}</td><td>{{ lot.currency }}</td><td>ledger event {{ lot.event_id }} · normalized source</td></tr>{% else %}<tr><td colspan="6" class="empty">No open lots in this namespace/scope.</td></tr>{% endfor %}</tbody></table></div></div><div class="card span-12"><h2>RECENT TRANSACTIONS / PROVENANCE</h2><div class="table-wrap"><table><thead><tr><th>DATE</th><th>TYPE</th><th>SYMBOL</th><th>QTY</th><th>GROSS</th><th>FEES</th><th>TAXES</th><th>SOURCE</th><th>EXTERNAL ID</th></tr></thead><tbody>{% for event in data.events %}<tr><td>{{ event.event_date }}</td><td>{{ event.event_type }}</td><td class="symbol">{{ event.symbol }}</td><td>{{ event.quantity }}</td><td>{{ event.gross_amount }} {{ event.currency }}</td><td>{{ event.fees }}</td><td>{{ event.taxes }}</td><td>{{ event.source }}</td><td>{{ event.external_id or '—' }}</td></tr>{% else %}<tr><td colspan="9" class="empty">No ledger events for this scope.</td></tr>{% endfor %}</tbody></table></div></div></div>
 {% elif section == 'trades' %}<div class="grid"><div class="card span-6"><h2>PAPER ORDER TICKET</h2><form id="paper-order" class="form-grid"><label>Symbol<input name="symbol" placeholder="INFY" required></label><label>Side<select name="side"><option>buy</option><option>sell</option></select></label><label>Quantity<input name="quantity" type="number" step="0.0001" required></label><label>Quote price<input name="quote_price" type="number" step="0.01" required></label><label>Currency<input name="currency" value="INR"></label><label>Account ID<input name="account_id" value="operator"></label><label>Portfolio ID<input name="portfolio_id" value="Main"></label><label>Idempotency key<input name="idempotency_key" required></label><div class="actions"><button>Submit paper order</button><button type="button" class="danger" data-action="kill-switch">Enable kill switch</button></div></form><div id="result" class="status">Paper gateway ready. Risk checks remain active.</div></div><div class="card span-6"><h2>ORDER HISTORY</h2><div class="table-wrap"><table><thead><tr><th>ID</th><th>PAYLOAD</th><th>STATUS</th><th>MODE</th></tr></thead><tbody>{% for o in data.orders %}<tr><td>{{ o.id }}</td><td>{{ o.symbol if o.symbol is defined else o.order_payload }}</td><td>{{ o.status }}</td><td>{{ o.mode }}</td></tr>{% else %}<tr><td colspan="4" class="muted">No orders yet.</td></tr>{% endfor %}</tbody></table></div></div></div>
-{% elif section == 'integrations' %}<div class="grid">{% for name,status in data.items() %}<div class="card span-6"><h2>{{ name|upper }} <span class="{{ 'up' if status.connected else 'warn' }}">● {{ status.status|upper }}</span></h2><p class="muted">Source: {{ status.source or 'none' }} · Account: {{ status.account_id }} · Last sync: {{ status.last_sync or 'never' }} · Sync state: {{ status.last_sync_status or 'never' }} · Reconciliation: {{ status.reconciliation_status or 'never' }}{% if status.last_sync_error %} · Error: {{ status.last_sync_error.message or status.last_sync_error.code }}{% endif %}</p><p>Mode: <b>{{ status.mode|default('mcp_only') }}</b> · Transport: <b>{{ status.transport|default('mcp') }}</b> · Endpoint: <code>{{ status.mcp_endpoint or 'unconfigured' }}</code></p><p>MCP status: <b>{{ status.mcp_status|default('unconfigured')|upper }}</b> · Discovered tools: <code>{{ status.discovered_tools|join(', ') if status.discovered_tools else 'none' }}</code> · read-only; live writes disabled.</p>{% if status.mcp_endpoint %}<div class="actions"><a class="button" href="{{ url_for('integration_start', name=name) }}">Authorize / reconnect in browser</a><button type="button" onclick="syncIntegration('{{ name }}')">Discover + sync verified read</button></div>{% endif %}<p>Capabilities: read={{ 'yes' if status.capabilities.read else 'no' }}, reconciliation={{ 'yes' if status.capabilities.reconciliation else 'no' }}, trading=no. Live writes disabled.</p>{% if name == 'indmoney' %}<a class="button" href="{{ url_for('indmoney_connect') }}">Official MCP handoff</a>{% else %}<form method="post" action="{{ url_for('integration_config', name=name) }}" class="form-grid"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% if name == 'kite' %}<label>API key<input name="api_key" autocomplete="off"></label><label>API secret<input name="api_secret" type="password" autocomplete="new-password"></label>{% else %}<label>Client ID<input name="client_id" autocomplete="off"></label><label>Client secret<input name="client_secret" type="password" autocomplete="new-password"></label>{% endif %}<label>Redirect URL<input name="redirect_uri" type="url" required value="{{ status.redirect_uri or '' }}"></label><button>Save encrypted config</button></form><div class="actions"><a class="button" href="{{ url_for('integration_start', name=name) }}">Start OAuth</a><button type="button" onclick="syncIntegration('{{ name }}')">Refresh status</button></div>{% endif %}<div class="status">{{ 'CONNECTED' if status.connected else 'UNCONFIGURED / STALE' }} · no provider claim beyond saved local status.</div></div>{% endfor %}</div><div id="result" class="status">Integration actions report here.</div>
+{% elif section == 'integrations' %}<div class="grid">{% for name,status in data.items() %}<div class="card span-6"><h2>{{ name|upper }} <span class="{{ 'up' if status.connected else 'warn' }}">● {{ status.status|upper }}</span></h2><p class="muted">Source: {{ status.source or 'none' }} · Account: {{ status.account_id }} · Last sync: {{ status.last_sync or 'never' }} · Sync state: {{ status.last_sync_status or 'never' }} · Reconciliation: {{ status.reconciliation_status or 'never' }}{% if status.last_sync_error %} · Error: {{ status.last_sync_error.message or status.last_sync_error.code }}{% endif %}</p><p>Mode: <b>{{ status.mode|default('mcp_only') }}</b> · Transport: <b>{{ status.transport|default('mcp') }}</b> · Endpoint: <code>{{ status.mcp_endpoint or 'unconfigured' }}</code></p><p>MCP status: <b>{{ status.mcp_status|default('unconfigured')|upper }}</b> · Discovered tools: <code>{{ status.discovered_tools|join(', ') if status.discovered_tools else 'none' }}</code> · read-only; live writes disabled.</p>{% if status.mcp_endpoint %}<div class="actions"><a class="button" href="{{ url_for('integration_start', name=name) }}">Authorize / reconnect in browser</a><button type="button" onclick="syncIntegration('{{ name }}')">Discover + sync verified read</button></div>{% endif %}<p>Capabilities: read={{ 'yes' if status.capabilities.read else 'no' }}, reconciliation={{ 'yes' if status.capabilities.reconciliation else 'no' }}, trading=no. Live writes disabled.</p>{% if name == 'indmoney' %}<a class="button" href="{{ url_for('indmoney_connect') }}">Official MCP handoff</a>{% else %}<form method="post" action="{{ url_for('integration_config', name=name) }}" class="form-grid"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% if name == 'kite' %}<label>Public client ID<input name="client_id" autocomplete="off"></label>{% else %}<label>Client ID<input name="client_id" autocomplete="off"></label>{% endif %}<label>Redirect URL<input name="redirect_uri" type="url" required value="{{ status.redirect_uri or '' }}"></label><button>Save encrypted config</button></form><div class="actions"><a class="button" href="{{ url_for('integration_start', name=name) }}">Start OAuth</a><button type="button" onclick="syncIntegration('{{ name }}')">Refresh status</button></div>{% endif %}<div class="status">{{ 'CONNECTED' if status.connected else 'UNCONFIGURED / STALE' }} · no provider claim beyond saved local status.</div></div>{% endfor %}</div><div id="result" class="status">Integration actions report here.</div>
 {% elif section == 'strategies' %}<div class="card"><h2>PROPOSAL TICKET</h2><form id="strategy-form" class="form-grid"><label>Strategy<select name="strategy"><option>kite-short-term/v1</option><option>upstox-long-term/v1</option><option>indmoney-us-read-only/v1</option></select></label><label>Symbol<input name="symbol" value="INFY" required></label><label>Market<input name="market" value="INDIA"></label><label>Currency<input name="currency" value="INR"></label><label>Price<input name="price" type="number" step="0.01" required></label><label>Signal<select name="signal"><option>buy</option><option>sell</option><option>hold</option></select></label><label>Quantity<input name="quantity" value="1"></label><label>Source ID<input name="source_id" value="operator-input"></label><div class="actions"><button>Generate paper proposal</button></div></form><div id="result" class="status">Proposals are suggestions only and never execute.</div></div>
 {% elif section == 'scheduler' %}<div class="grid"><div class="card span-6"><h2>SCHEDULER CONTROL</h2><p>Enabled: <b>{{ 'YES' if data.enabled else 'NO' }}</b></p><div class="actions"><button onclick="postJson('/api/scheduler/state',{enabled:'true'})">Enable</button><button onclick="postJson('/api/scheduler/state',{enabled:'false'})">Disable</button><button onclick="postJson('/api/scheduler/run',{})">Run due proposals</button></div><div id="result" class="status">Scheduler is paper/proposal-only.</div></div><div class="card span-6"><h2>RECENT RUNS</h2><div class="table-wrap"><table><thead><tr><th>TIME</th><th>STATUS</th><th>DETAIL</th></tr></thead><tbody>{% for run in data.runs %}<tr><td>{{ run.created_at }}</td><td>{{ run.status }}</td><td>{{ run.message if run.message is defined else run }}</td></tr>{% else %}<tr><td colspan="3" class="muted">No scheduler runs.</td></tr>{% endfor %}</tbody></table></div></div></div>
 {% elif section == 'audit' %}<div class="grid"><div class="card span-6"><h2>RISK CONTROL</h2><p>Kill switch: <b>{{ data.kill_switch|upper }}</b></p><div class="actions"><button class="danger" onclick="postJson('/api/risk/kill-switch',{state:'on'})">Turn ON</button><button onclick="postJson('/api/risk/kill-switch',{state:'off'})">Turn OFF</button></div><div id="result" class="status">Risk actions are audited and paper-only.</div></div><div class="card span-6"><h2>LIVE APPROVALS</h2><p class="muted">Approval records never execute live orders.</p>{% for a in data.approvals %}<p>{{ a.id }} · {{ a.status }} · {{ a.proposal_id }}</p>{% else %}<p class="muted">No approval records.</p>{% endfor %}</div><div class="card span-12"><h2>AUDIT EVENT STREAM</h2><div class="table-wrap"><table><thead><tr><th>TIME</th><th>EVENT</th><th>ENTITY</th><th>MODE</th></tr></thead><tbody>{% for e in data.events %}<tr><td>{{ e.created_at }}</td><td>{{ e.event_type }}</td><td>{{ e.entity_type }} {{ e.entity_id }}</td><td>{{ e.mode }}</td></tr>{% else %}<tr><td colspan="4" class="muted">No audit events.</td></tr>{% endfor %}</tbody></table></div></div></div>
@@ -775,23 +781,13 @@ def api_integrations():
 @app.post("/integrations/<name>/config")
 @app.post("/api/integrations/<name>/config")
 def integration_config(name: str):
-    if name not in {"kite", "upstox"}:
-        return jsonify({"error": "INDmoney has no app credentials or trading OAuth configuration"}), 405
-    if not _csrf_ok():
-        return jsonify({"error": "CSRF validation failed"}), 403
+    if name not in {"kite", "upstox", "indmoney"}:
+        return jsonify({"error": "unknown integration"}), 404
+    if not _csrf_ok(): return jsonify({"error": "CSRF validation failed"}), 403
     payload = _payload()
-    fields = ("api_key", "api_secret", "redirect_uri") if name == "kite" else ("client_id", "client_secret", "redirect_uri")
-    try:
-        existing = integration_auth.get_provider(_integration_secret_key(), name)
-    except (KeyError, RuntimeError) as exc:
-        return jsonify({"error": str(exc)}), 500
-    if any(not str(payload.get(key, "")).strip() and not existing.get(key) for key in fields):
-        return jsonify({"error": "missing required provider app field"}), 400
-    values = {key: str(payload[key]) for key in fields if str(payload.get(key, "")).strip()}
-    try:
-        integration_auth.save_config(_integration_secret_key(), name, values)
-    except (KeyError, RuntimeError) as exc:
-        return jsonify({"error": str(exc)}), 500
+    values = {key: str(payload[key]) for key in ("client_id", "account_id") if str(payload.get(key, "")).strip()}
+    try: integration_auth.save_config(_integration_secret_key(), name, values)
+    except (KeyError, RuntimeError) as exc: return jsonify({"error": str(exc)}), 500
     return redirect(url_for("operator_page", section="integrations")) if request.path.startswith("/integrations/") else jsonify(integration_auth.status(_integration_secret_key(), name))
 
 
@@ -799,61 +795,41 @@ def integration_config(name: str):
 @app.post("/integrations/<name>/start")
 @app.post("/api/integrations/<name>/connect")
 def integration_start(name: str):
-    if name not in integration_auth.PROVIDERS:
-        return jsonify({"error": "unknown integration"}), 404
-    if load_settings().get("provider_modes", {}).get(name, "mcp_only") == "mcp_only":
-        endpoint = OFFICIAL_MCP_ENDPOINTS.get(name)
-        # MCP-only is strict: never route a provider connection through the
-        # legacy REST/API OAuth flow, even when historical credentials exist.
-        if endpoint:
-            return redirect(endpoint["url"])
-        return jsonify({"error": f"{name} MCP endpoint is not configured"}), 503
-    if request.method == "POST" and not _csrf_ok():
-        return jsonify({"error": "CSRF validation failed"}), 403
+    if name not in integration_auth.PROVIDERS: return jsonify({"error": "unknown integration"}), 404
+    if load_settings().get("provider_modes", {}).get(name, "mcp_only") != "mcp_only":
+        return jsonify({"error": "provider REST/API transport is disabled; use mcp_only"}), 409
+    if request.method == "POST" and not _csrf_ok(): return jsonify({"error": "CSRF validation failed"}), 403
+    endpoint = OFFICIAL_MCP_ENDPOINTS.get(name)
+    if not endpoint: return jsonify({"error": "official MCP endpoint is not configured"}), 503
     try:
-        state = secrets.token_urlsafe(32)
-        session["oauth_state"] = {"provider": name, "value": state, "started_at": datetime.now(timezone.utc).isoformat()}
-        return redirect(integration_auth.authorization_url(_integration_secret_key(), name, state))
-    except (KeyError, ValueError, RuntimeError) as exc:
-        return jsonify({"error": str(exc)}), 400
+        cfg = oauth_provider_config(name)
+        metadata = integration_auth.fetch_metadata(endpoint["url"], metadata_url=cfg["metadata_url"])
+        client_id = integration_auth.get_provider(_integration_secret_key(), name).get("client_id")
+        if not client_id and metadata.get("registration_endpoint"):
+            registration = integration_auth._post_json(metadata["registration_endpoint"], {"client_name": "portfolio-tracker", "redirect_uris": [url_for("oauth_callback", name=name, _external=True)], "token_endpoint_auth_method": "none"})
+            client_id = registration.get("client_id")
+            if not client_id: raise RuntimeError("dynamic client registration returned no client_id")
+            integration_auth.save_config(_integration_secret_key(), name, {"client_id": str(client_id), "token_endpoint": str(metadata.get("token_endpoint"))})
+        if not client_id: raise RuntimeError("no public OAuth client is configured and dynamic registration is unavailable")
+        if not integration_auth.get_provider(_integration_secret_key(), name).get("token_endpoint"):
+            integration_auth.save_config(_integration_secret_key(), name, {"token_endpoint": str(metadata["token_endpoint"])})
+        target = integration_auth.begin_oauth(_integration_secret_key(), name, session_id=str(session.get("oauth_session_id", "")), redirect_uri=url_for("oauth_callback", name=name, _external=True), metadata=metadata, authorization_url=cfg["authorization_url"])
+        return redirect(target)
+    except (KeyError, ValueError, RuntimeError, OSError) as exc:
+        return jsonify({"status": "authorization_required", "error": redact(str(exc)), "provider": name, "mcp_endpoint": endpoint["url"], "authorization_url": oauth_provider_config(name).get("authorization_url")}), 409
 
 
 @app.get("/oauth/<name>/callback")
 def oauth_callback(name: str):
-    if name not in {"kite", "upstox"}:
-        return jsonify({"error": "unknown OAuth provider"}), 404
-    expected = session.get("oauth_state") or {}
-    if not expected or expected.get("provider") != name:
-        return jsonify({"error": "invalid or expired OAuth state"}), 400
-    if name == "kite":
-        # Kite's callback does not return OAuth state; bind the one-time request
-        # token to the same authenticated browser session and a short window.
-        try:
-            started = datetime.fromisoformat(str(expected.get("started_at")))
-            if (datetime.now(timezone.utc) - started).total_seconds() > 600:
-                raise ValueError
-        except (TypeError, ValueError):
-            return jsonify({"error": "invalid or expired OAuth state"}), 400
-    elif not request.args.get("state") or not secrets.compare_digest(str(expected.get("value")), str(request.args.get("state"))):
-        return jsonify({"error": "invalid or expired OAuth state"}), 400
-    session.pop("oauth_state", None)
-    if request.args.get("error"):
-        return jsonify({"error": "provider authorization was denied", "provider_error": request.args.get("error")} ), 400
-    code = request.args.get("request_token" if name == "kite" else "code")
-    if not code:
-        return jsonify({"error": "provider callback code is missing"}), 400
+    if name not in integration_auth.PROVIDERS: return jsonify({"error": "unknown OAuth provider"}), 404
+    if request.args.get("error"): return jsonify({"error": "provider authorization was denied", "provider_error": request.args.get("error")}), 400
+    state, code = request.args.get("state"), request.args.get("code")
+    if not state or not code: return jsonify({"error": "OAuth callback state and code are required"}), 400
+    record = integration_auth.get_provider(_integration_secret_key(), name)
     try:
-        integration_auth.exchange_code(_integration_secret_key(), name, code)
+        integration_auth.complete_oauth(_integration_secret_key(), name, state=state, code=code, session_id=str(session.get("oauth_session_id", "")), token_endpoint=str(record.get("token_endpoint") or ""))
     except (KeyError, ValueError, RuntimeError, OSError) as exc:
-        if isinstance(exc, RuntimeError):
-            detail = str(exc)[:220]
-        elif isinstance(exc, KeyError):
-            detail = f"missing provider configuration field: {str(exc.args[0])[:80] if exc.args else 'unknown'}"
-        elif isinstance(exc, ValueError):
-            detail = f"invalid provider response or configuration: {str(exc)[:160]}"
-        else:
-            detail = "provider network error"
-        return jsonify({"error": "provider token exchange failed", "detail": redact(detail)}), 400
+        return jsonify({"error": "provider OAuth callback failed", "detail": redact(str(exc))}), 400
     return redirect(url_for("operator_page", section="integrations"))
 
 
@@ -880,7 +856,11 @@ def api_integration_sync(name: str):
     if not _csrf_ok():
         return jsonify({"error": "CSRF validation failed"}), 403
     try:
-        db = Database(); db.init_db(); result = ProviderSyncService(db).sync(_provider_adapter(name))
+        db = Database(); db.init_db(); adapter = _provider_adapter(name); result = ProviderSyncService(db).sync(adapter)
+        if result["status"] == "succeeded":
+            integration_auth.mark_mcp_verified(_integration_secret_key(), name, session_id=str(session.get("oauth_session_id", "")), tools=sorted(adapter.client.tools))
+        if result.get("error", {}).get("code") == "mcp_authorization_required":
+            return jsonify({"integration": name, "status": "authorization_required", "error": result["error"], "authorization_url": adapter.client.authorization_url, "live_writes": False}), 409
         return jsonify({"integration": name, **result}), 200 if result["status"] == "succeeded" else 502
     except MCPAuthorizationRequired as exc:
         return jsonify({"integration": name, "status": "authorization_required", "error": {"code": exc.code, "message": exc.message, "retryable": False}, "authorization_url": exc.authorization_url, "live_writes": False}), 409
