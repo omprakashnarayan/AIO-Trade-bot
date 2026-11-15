@@ -137,7 +137,8 @@ def test_strategy_and_integration_surfaces_are_local(tmp_path, monkeypatch):
     assert proposal.get_json()["intent"]["mode"] == "paper"
     status = client.get("/api/integrations").get_json()["integrations"]
     assert status["indmoney"]["read_only"] is True
-    assert "unconfigured" in status["kite"]["status"]
+    assert status["kite"]["status"] in {"authorization_required", "authorized"}
+    assert status["kite"]["mcp_verified"] is False
 
 
 def test_ledger_workspace_renders_filters_import_controls_and_exports(tmp_path, monkeypatch):
