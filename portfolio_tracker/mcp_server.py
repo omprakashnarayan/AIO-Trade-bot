@@ -41,12 +41,16 @@ class MCPServer:
     def __init__(self, db_factory: Callable[[], Database] = Database): self.db_factory = db_factory
     def _db(self):
         db = self.db_factory(); db.init_db(); return db
-    def _scope(self, args):
+    def _scope(self, name, args):
         for key in ("account_id", "portfolio_id", "portfolio"):
             configured = os.environ.get("PORTFOLIO_MCP_" + key.upper())
             if configured and args.get(key) and str(args[key]) != configured: raise PermissionError("requested namespace is outside MCP token scope")
+        if name in {"holdings", "portfolio_summary", "ledger_tax_report"} and not args.get("portfolio"):
+            configured = os.environ.get("PORTFOLIO_MCP_PORTFOLIO")
+            if configured: return {**args, "portfolio": configured}
+        return args
     def call(self, name: str, args: dict[str, Any], actor: str = "mcp") -> Any:
-        self._scope(args)
+        args = self._scope(name, args)
         db = self._db()
         if name == "health_status": return {"status":"ok","paper_only":True,"live_tools":False,"timestamp":datetime.now(timezone.utc).isoformat()}
         if name == "holdings":
