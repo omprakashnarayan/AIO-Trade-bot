@@ -89,7 +89,7 @@ def test_every_operator_workspace_uses_terminal_shell_and_controls(tmp_path, mon
         "ledger": ("LEDGER / TAX SCOPE", "Preview import"),
         "agents": ("AGENT CONTROL PLANE", "Run now"),
         "trades": ("PAPER ORDER TICKET", "Submit paper order"),
-        "integrations": ("INTEGRATIONS", "Refresh status"),
+        "integrations": ("INTEGRATIONS", "Discover + sync verified read"),
         "strategies": ("PROPOSAL TICKET", "Generate paper proposal"),
         "scheduler": ("SCHEDULER CONTROL", "Run due proposals"),
         "audit": ("RISK CONTROL", "AUDIT EVENT STREAM"),

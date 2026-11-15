@@ -44,9 +44,11 @@ def test_provenance_feedback_and_paper_gate(tmp_path):
 def test_authenticated_research_api_and_live_rejection(tmp_path, monkeypatch):
     client, db = setup_client(monkeypatch, tmp_path)
     assert client.get("/api/research/news").get_json()["external_call"] is False
-    response = client.post("/api/research/run", json={"topic": "market", "facts": []})
+    with client.session_transaction() as sess:
+        csrf = {"X-CSRF-Token": sess["csrf_token"]}
+    response = client.post("/api/research/run", json={"topic": "market", "facts": []}, headers=csrf)
     assert response.status_code == 200
     assert response.get_json()["status"] == "unavailable"
-    live = client.post("/api/orders/paper", json={"mode": "live"})
+    live = client.post("/api/orders/paper", json={"mode": "live"}, headers=csrf)
     assert live.status_code == 409
     assert db.list_research_runs()
