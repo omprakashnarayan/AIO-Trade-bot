@@ -104,49 +104,105 @@ def status(secret_key: str | bytes, provider: str) -> dict[str, Any]:
             "mcp_verified": verified, "discovered_tools": record.get("mcp_tools", []) if isinstance(record.get("mcp_tools", []), list) else []}
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise RuntimeError("OAuth endpoint redirects are not trusted")
+
+
+def _urlopen(req: urllib.request.Request, timeout: int, opener=None):
+    if opener is not None: return opener.urlopen(req, timeout=timeout)
+    return urllib.request.build_opener(_NoRedirect()).open(req, timeout=timeout)
+
+
+def _official_url(url: str, *, origin: str | None = None) -> urllib.parse.SplitResult:
+    """Only HTTPS URLs on the official MCP origin can carry OAuth metadata or credentials."""
+    try:
+        if not isinstance(url, str): raise ValueError("invalid URL")
+        parsed = urllib.parse.urlsplit(url)
+        allowed = {urllib.parse.urlsplit(item["url"]).netloc for item in OFFICIAL_MCP_ENDPOINTS.values()}
+        if (parsed.scheme != "https" or not parsed.hostname
+                or parsed.username is not None or parsed.password is not None
+                or parsed.fragment or parsed.netloc not in allowed
+                or (origin is not None and parsed.netloc != origin)):
+            raise ValueError("untrusted origin")
+    except (ValueError, TypeError):
+        raise RuntimeError("OAuth URL must use an official HTTPS origin") from None
+    return parsed
+
+
 def _post(url: str, form: dict[str, str], *, opener=None) -> dict[str, Any]:
+    _official_url(url)
     req = urllib.request.Request(url, data=urllib.parse.urlencode(form).encode(), headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"}, method="POST")
     try:
-        with (opener or urllib.request).urlopen(req, timeout=20) as response: return json.loads(response.read().decode())
+        with _urlopen(req, timeout=20, opener=opener) as response: return json.loads(response.read().decode())
     except urllib.error.HTTPError as exc:
         raise RuntimeError(f"provider OAuth request failed with HTTP {exc.code}") from None
 
 
 def _post_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
+    _official_url(url)
     req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json", "Accept": "application/json"}, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=20) as response: return json.loads(response.read().decode())
+        with _urlopen(req, timeout=20) as response: return json.loads(response.read().decode())
     except urllib.error.HTTPError as exc:
         raise RuntimeError(f"provider OAuth registration failed with HTTP {exc.code}") from None
 
 
 def fetch_metadata(endpoint: str, *, metadata_url: str | None = None, opener=None) -> dict[str, Any]:
-    client = opener or urllib.request
-    base = endpoint.rstrip("/")
-    candidates = [metadata_url] if metadata_url else [base + "/.well-known/oauth-protected-resource", base + "/.well-known/oauth-authorization-server"]
+    resource = _official_url(endpoint)
+    origin = resource.netloc
+    # RFC 9728 inserts the well-known segment before the resource's path.
+    protected = f"https://{origin}/.well-known/oauth-protected-resource{resource.path.rstrip('/')}"
+    # RFC 8414 inserts the well-known segment before an issuer's path.
+    default_auth = f"https://{origin}/.well-known/oauth-authorization-server"
+    candidates = [metadata_url] if metadata_url else [protected, default_auth]
     last_error = None
+
+    def get(url: str) -> dict[str, Any]:
+        _official_url(url, origin=origin)
+        with _urlopen(urllib.request.Request(url, headers={"Accept": "application/json"}), timeout=10, opener=opener) as response:
+            payload = json.loads(response.read().decode())
+        if not isinstance(payload, dict): raise RuntimeError("OAuth metadata is invalid")
+        return payload
+
+    def validate_auth(payload: dict[str, Any], issuer: str | None = None) -> dict[str, Any]:
+        if issuer is not None and payload.get("issuer") != issuer:
+            raise RuntimeError("OAuth authorization server issuer mismatch")
+        if payload.get("issuer"):
+            _official_url(payload["issuer"], origin=origin)
+        for field in ("authorization_endpoint", "token_endpoint", "registration_endpoint"):
+            if payload.get(field):
+                try: _official_url(payload[field], origin=origin)
+                except RuntimeError: raise RuntimeError(f"OAuth {field} is not a trusted endpoint") from None
+        if not payload.get("authorization_endpoint") or not payload.get("token_endpoint"):
+            raise RuntimeError("OAuth metadata is incomplete")
+        return payload
+
     for url in candidates:
         if not url: continue
-        req = urllib.request.Request(url, headers={"Accept": "application/json"})
         try:
-            with client.urlopen(req, timeout=10) as response:
-                payload = json.loads(response.read().decode())
-            if not isinstance(payload, dict): raise RuntimeError("OAuth metadata is invalid")
-            if payload.get("authorization_endpoint") and payload.get("token_endpoint"):
-                return payload
-            servers = payload.get("authorization_servers") or []
-            issuer = str(servers[0]).rstrip("/") if servers else ""
-            if issuer:
-                auth_candidates = [issuer + "/.well-known/oauth-authorization-server", issuer + "/.well-known/openid-configuration"]
-                for auth_url in auth_candidates:
+            payload = get(url)
+            if url == protected or "authorization_servers" in payload or "resource" in payload:
+                if payload.get("resource") != endpoint:
+                    raise RuntimeError("OAuth protected resource mismatch")
+                servers = payload.get("authorization_servers") or []
+                if not isinstance(servers, list) or not servers:
+                    raise RuntimeError("OAuth authorization server issuer is missing")
+                issuer = servers[0]
+                try: parsed = _official_url(issuer, origin=origin)
+                except RuntimeError: raise RuntimeError("OAuth authorization server issuer is not trusted") from None
+                auth_paths = ("oauth-authorization-server", "openid-configuration")
+                for name in auth_paths:
+                    auth_url = f"https://{origin}/.well-known/{name}{parsed.path.rstrip('/')}"
                     try:
-                        with client.urlopen(urllib.request.Request(auth_url, headers={"Accept": "application/json"}), timeout=10) as auth_response:
-                            auth_payload = json.loads(auth_response.read().decode())
-                        if isinstance(auth_payload, dict) and auth_payload.get("authorization_endpoint") and auth_payload.get("token_endpoint"):
-                            return {**auth_payload, "scopes_supported": payload.get("scopes_supported", auth_payload.get("scopes_supported"))}
+                        auth_payload = get(auth_url)
+                        return {**validate_auth(auth_payload, issuer=issuer),
+                                "scopes_supported": payload.get("scopes_supported", auth_payload.get("scopes_supported"))}
                     except (urllib.error.HTTPError, urllib.error.URLError, OSError, ValueError):
                         continue
-            last_error = "OAuth metadata is incomplete"
+                last_error = "OAuth authorization server metadata is unavailable"
+            else:
+                return validate_auth(payload)
         except urllib.error.HTTPError as exc:
             last_error = f"OAuth metadata unavailable (HTTP {exc.code})"
         except (urllib.error.URLError, OSError, ValueError):
