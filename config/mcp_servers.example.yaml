@@ -24,13 +24,14 @@ mcp_servers:
       source: "official Zerodha hosted MCP endpoint"
 
   upstox:
-    url: "# unconfigured: no official endpoint verified"
+    url: "https://mcp.upstox.com/mcp"
     policy:
       mode: mcp_only
-      status: unconfigured_honest_no_verified_official_endpoint
+      status: browser_authorization_required_until_real_read_succeeds
       capabilities: [read_only_after_discovery_schema_validation_and_reconciliation]
       writes: disabled
       oauth_api_sync: disabled
+      source: "official Upstox hosted MCP endpoint"
 
   indmoney:
     url: "https://mcp.indmoney.com/mcp"
