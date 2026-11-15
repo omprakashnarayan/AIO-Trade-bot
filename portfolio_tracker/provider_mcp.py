@@ -19,6 +19,33 @@ from .brokers.base import AdapterCapability, BrokerAdapterError, BrokerMetadata,
 
 _SECRET = re.compile(r"(?i)(bearer\s+|token[=:]\s*|api[_-]?key[=:]\s*|secret[=:]\s*|password[=:]\s*)[^\s,;]+|sk-[A-Za-z0-9_-]+|ghp_[A-Za-z0-9]+")
 
+# Exact portfolio-read names only: discovery must never grant a new broker
+# operation permission merely because it was not in a write-tool denylist.
+_PORTFOLIO_READ_TOOLS = frozenset((
+    "snapshot", "portfolio_snapshot", "get_portfolio_snapshot",
+    "holdings", "get_holdings", "positions", "get_positions",
+))
+_WRITE_SEMANTICS = re.compile(
+    r"\b(?:buy|sell|trade|trading|order|orders|place|submit|execute|cancel|modify|"
+    r"update|create|delete|transfer|withdraw|deposit|rebalance)\b", re.I,
+)
+
+
+def _safe_read_schema(schema: Mapping[str, Any]) -> bool:
+    """Only no-argument and account-scoped portfolio reads are supported."""
+    properties = schema.get("properties", {})
+    required = schema.get("required", [])
+    if schema.get("type", "object") != "object" or not isinstance(properties, Mapping):
+        return False
+    if not isinstance(required, list) or any(not isinstance(key, str) for key in required):
+        return False
+    if set(properties) - {"account_id"} or set(required) - set(properties):
+        return False
+    if any(key in schema for key in ("oneOf", "anyOf", "allOf", "$ref", "patternProperties")):
+        return False
+    account = properties.get("account_id")
+    return account is None or (isinstance(account, Mapping) and account.get("type", "string") == "string")
+
 
 def redact(value: Any) -> Any:
     if isinstance(value, str):
@@ -115,21 +142,22 @@ class MCPClient:
 
     def discover(self) -> dict[str, DiscoveredTool]:
         if not self.initialized: self.initialize()
+        self.tools = {}
+        self.verified = False
         result = self._rpc("tools/list", {})
         raw = result.get("tools") if isinstance(result, Mapping) else None
         if not isinstance(raw, list):
             raise BrokerAdapterError("mcp_discovery_invalid", "provider MCP tools/list did not return tools", provider=self.provider)
-        self.tools = {}
         for item in raw:
             if not isinstance(item, Mapping) or not isinstance(item.get("name"), str): continue
             schema = item.get("inputSchema", {})
-            if not isinstance(schema, Mapping) or schema.get("type", "object") != "object": continue
             name = item["name"]
-            # Provider-hosted servers may advertise write tools. Never retain or
-            # expose destructive tools in this app's MCP-only read policy.
-            if any(word in name.lower() for word in ("place_order", "submit_order", "modify_order", "cancel_order", "execute_order", "transfer", "withdraw")):
+            description = item.get("description", "")
+            if (name not in _PORTFOLIO_READ_TOOLS or not isinstance(description, str)
+                    or _WRITE_SEMANTICS.search(description) or not isinstance(schema, Mapping)
+                    or not _safe_read_schema(schema)):
                 continue
-            self.tools[name] = DiscoveredTool(name, dict(schema), str(item.get("description", "")))
+            self.tools[name] = DiscoveredTool(name, dict(schema), description)
         self.verified = bool(self.tools)
         if not self.verified:
             raise BrokerAdapterError("mcp_no_read_tools", "provider MCP exposed no verifiable tools", provider=self.provider)
@@ -143,7 +171,16 @@ class MCPClient:
     def call(self, name: str, arguments: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
         if not self.verified or name not in self.tools:
             raise BrokerAdapterError("tool_unverified", "provider MCP tool was not discovered and verified", provider=self.provider)
-        result = self._rpc("tools/call", {"name": name, "arguments": dict(arguments or {})})
+        schema = self.tools[name].input_schema
+        if arguments is not None and not isinstance(arguments, Mapping):
+            raise BrokerAdapterError("mcp_tool_arguments_invalid", "provider MCP read arguments are invalid", provider=self.provider)
+        args = dict(arguments or {})
+        properties = schema.get("properties", {})
+        if (not _safe_read_schema(schema) or set(args) - set(properties)
+                or set(schema.get("required", [])) - set(args)
+                or ("account_id" in args and not isinstance(args["account_id"], str))):
+            raise BrokerAdapterError("mcp_tool_arguments_invalid", "provider MCP read arguments do not match discovered schema", provider=self.provider)
+        result = self._rpc("tools/call", {"name": name, "arguments": args})
         if isinstance(result, Mapping) and result.get("isError"):
             raise BrokerAdapterError("mcp_tool_error", "provider MCP read tool returned an error", provider=self.provider)
         # MCP content commonly wraps JSON in a text content block.
@@ -174,7 +211,9 @@ class MCPProviderAdapter:
         aliases = ("snapshot", "portfolio_snapshot", "get_portfolio_snapshot", "holdings", "get_holdings", "positions", "get_positions")
         for alias in aliases:
             if alias in self.client.tools:
-                return self.client.call(alias, {"account_id": self._account_id})
+                properties = self.client.tools[alias].input_schema.get("properties", {})
+                arguments = {"account_id": self._account_id} if "account_id" in properties else {}
+                return self.client.call(alias, arguments)
         raise BrokerAdapterError("mcp_snapshot_tool_unverified", "no verified provider portfolio read tool was discovered", provider=self.provider_name)
 
     def submit_order(self, intent):
