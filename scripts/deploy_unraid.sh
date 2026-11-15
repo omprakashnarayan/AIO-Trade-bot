@@ -6,8 +6,17 @@ CONTAINER="${CONTAINER:-portfolio-tracker}"
 APPDATA_DIR="${APPDATA_DIR:-/mnt/user/appdata/portfolio-tracker}"
 PORT="${PORT:-5055}"
 HOST_IP="${HOST_IP:-192.168.200.196}"
-ADMIN_USERNAME="${PORTFOLIO_ADMIN_USERNAME:-}"
+ADMIN_USERNAME="${PORTFOLIO_ADMIN_USERNAME:-admin}"
 ADMIN_PASSWORD_HASH="${PORTFOLIO_ADMIN_PASSWORD_HASH:-}"
+ADMIN_PASSWORD_HASH_FILE="${PORTFOLIO_ADMIN_PASSWORD_HASH_FILE:-/mnt/user/personalfiles/work/portfolio-tracker-admin-password-hash}"
+# The protected hash file is authoritative across redeploys. Never silently
+# replace it with a temporary/default password or deploy an unlocked console.
+if [ -s "$ADMIN_PASSWORD_HASH_FILE" ]; then
+  ADMIN_PASSWORD_HASH="$(tr -d '\n' < "$ADMIN_PASSWORD_HASH_FILE")"
+elif [ -z "$ADMIN_PASSWORD_HASH" ]; then
+  echo "Admin password hash is missing; refusing deployment." >&2
+  exit 1
+fi
 SESSION_SECRET="${PORTFOLIO_SESSION_SECRET:-}"
 ALLOWED_CIDRS="${PORTFOLIO_ALLOWED_CIDRS:-192.168.200.0/24,127.0.0.1/32}"
 MCP_API_TOKEN="${PORTFOLIO_MCP_API_TOKEN:-}"
