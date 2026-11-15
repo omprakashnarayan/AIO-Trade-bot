@@ -16,6 +16,11 @@ def auth_client(monkeypatch, db):
     return client
 
 
+def csrf_headers(client):
+    with client.session_transaction() as session:
+        return {"X-CSRF-Token": session["csrf_token"]}
+
+
 def test_missing_credentials_fail_closed(monkeypatch):
     monkeypatch.delenv("PORTFOLIO_ADMIN_USERNAME", raising=False)
     monkeypatch.delenv("PORTFOLIO_ADMIN_PASSWORD_HASH", raising=False)
@@ -29,22 +34,22 @@ def test_paper_order_uses_gateway_and_kill_switch(tmp_path, monkeypatch):
     client = auth_client(monkeypatch, db)
     db.init_db()
     db.upsert_cash_balance(balance="1000", currency="INR", account_id="acct", portfolio_id="Main", broker_id="paper")
-    response = client.post("/api/orders/paper", json={"idempotency_key": "order-1", "account_id": "acct", "portfolio_id": "Main", "symbol": "INFY", "side": "buy", "quantity": "2", "quote_price": "100", "currency": "INR"})
+    response = client.post("/api/orders/paper", json={"idempotency_key": "order-1", "account_id": "acct", "portfolio_id": "Main", "symbol": "INFY", "side": "buy", "quantity": "2", "quote_price": "100", "currency": "INR"}, headers=csrf_headers(client))
     assert response.status_code == 200
     assert response.get_json()["order"]["status"] == "filled"
-    assert client.post("/api/risk/kill-switch", json={"state": "on"}).status_code == 200
-    blocked = client.post("/api/orders/paper", json={"idempotency_key": "order-2", "account_id": "acct", "portfolio_id": "Main", "symbol": "INFY", "side": "buy", "quantity": "1", "quote_price": "100", "currency": "INR"})
+    assert client.post("/api/risk/kill-switch", json={"state": "on"}, headers=csrf_headers(client)).status_code == 200
+    blocked = client.post("/api/orders/paper", json={"idempotency_key": "order-2", "account_id": "acct", "portfolio_id": "Main", "symbol": "INFY", "side": "buy", "quantity": "1", "quote_price": "100", "currency": "INR"}, headers=csrf_headers(client))
     assert blocked.status_code == 422
     assert blocked.get_json()["risk"]["code"] == "global_kill_switch"
 
 
 def test_live_order_and_approval_never_execute(tmp_path, monkeypatch):
     client = auth_client(monkeypatch, Database(tmp_path / "console.sqlite3"))
-    live = client.post("/api/orders/paper", json={"mode": "live", "idempotency_key": "live-1", "portfolio_id": "Main", "symbol": "INFY", "side": "buy", "quantity": "1", "quote_price": "100"})
+    live = client.post("/api/orders/paper", json={"mode": "live", "idempotency_key": "live-1", "portfolio_id": "Main", "symbol": "INFY", "side": "buy", "quantity": "1", "quote_price": "100"}, headers=csrf_headers(client))
     assert live.status_code == 409
-    approval = client.post("/api/approvals", json={"proposal_id": "proposal-1", "proposal": {"proposal_id": "proposal-1", "mode": "live", "symbol": "INFY"}})
+    approval = client.post("/api/approvals", json={"proposal_id": "proposal-1", "proposal": {"proposal_id": "proposal-1", "mode": "live", "symbol": "INFY"}}, headers=csrf_headers(client))
     assert approval.status_code == 201
-    decided = client.post(f"/api/approvals/{approval.get_json()['id']}/decision", json={"status": "approved"})
+    decided = client.post(f"/api/approvals/{approval.get_json()['id']}/decision", json={"status": "approved"}, headers=csrf_headers(client))
     assert decided.status_code == 200
     assert decided.get_json()["execution"] == "still disabled"
 
@@ -132,7 +137,7 @@ def test_console_snapshot_is_authenticated_and_bounded(tmp_path, monkeypatch):
 def test_strategy_and_integration_surfaces_are_local(tmp_path, monkeypatch):
     client = auth_client(monkeypatch, Database(tmp_path / "console.sqlite3"))
     now = datetime.now(timezone.utc).isoformat()
-    proposal = client.post("/api/strategies/proposals", json={"strategy": "kite-short-term/v1", "symbol": "INFY", "market": "INDIA", "currency": "INR", "price": "100", "as_of": now, "now": now, "source_id": "manual", "signal": "buy", "quantity": "1", "broker_id": "kite", "account_id": "acct", "portfolio_id": "Main"})
+    proposal = client.post("/api/strategies/proposals", json={"strategy": "kite-short-term/v1", "symbol": "INFY", "market": "INDIA", "currency": "INR", "price": "100", "as_of": now, "now": now, "source_id": "manual", "signal": "buy", "quantity": "1", "broker_id": "kite", "account_id": "acct", "portfolio_id": "Main"}, headers=csrf_headers(client))
     assert proposal.status_code == 200
     assert proposal.get_json()["intent"]["mode"] == "paper"
     status = client.get("/api/integrations").get_json()["integrations"]
