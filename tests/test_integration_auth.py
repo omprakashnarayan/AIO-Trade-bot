@@ -50,6 +50,24 @@ def test_mcp_callback_requires_authorization_state_and_disconnect(monkeypatch, t
     assert c.post("/api/integrations/upstox/disconnect", headers={"X-CSRF-Token": token}).status_code == 200
 
 
+def test_legacy_api_token_is_not_mcp_authorization(monkeypatch, tmp_path):
+    monkeypatch.setenv("PORTFOLIO_INTEGRATIONS_PATH", str(tmp_path / "integrations.enc"))
+    integration_auth._save(str(web.app.secret_key), {"providers": {"kite": {"access_token": "legacy-only"}}})
+    state = integration_auth.status(str(web.app.secret_key), "kite")
+    assert state["oauth_authorized"] is False
+    assert state["connected"] is False
+    assert state["status"] == "authorization_required"
+
+
+def test_integrations_page_has_only_mcp_controls():
+    template = web.OPERATOR_PAGE_TEMPLATE
+    assert 'Authorize / reconnect in browser' in template
+    assert 'Discover + sync verified read' in template
+    assert 'Save encrypted config' not in template
+    assert 'Start OAuth' not in template
+    assert 'Official MCP handoff' not in template
+
+
 def test_indmoney_handoff_and_write_rejected(monkeypatch, tmp_path):
     c = client(monkeypatch, tmp_path)
     handoff = c.get("/integrations/indmoney/connect")

@@ -94,7 +94,7 @@ def status(secret_key: str | bytes, provider: str) -> dict[str, Any]:
     if expires_at:
         try: expired = datetime.fromisoformat(expires_at) <= datetime.now(timezone.utc)
         except ValueError: expired = True
-    oauth_authorized = bool(record.get("access_token")) and not expired
+    oauth_authorized = bool(record.get("access_token") and record.get("oauth_session")) and not expired
     verified = bool(record.get("mcp_verified")) and oauth_authorized
     endpoint = OFFICIAL_MCP_ENDPOINTS.get(provider)
     return {"provider": provider, "configured": bool(endpoint), "connected": verified,
