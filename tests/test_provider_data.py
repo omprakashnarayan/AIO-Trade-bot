@@ -38,6 +38,17 @@ def test_sync_is_idempotent_and_does_not_touch_manual_or_paper(tmp_path):
     assert first["reconciliation"]["manual_or_paper_mutated"] is False
 
 
+def test_unconfirmed_empty_holdings_read_cannot_claim_success_with_cached_rows(tmp_path):
+    db = _db(tmp_path)
+    responses = iter([{"data": {"holdings": [{"symbol": "INFY", "quantity": "2"}]}}, {"data": {"holdings": []}}])
+    adapter = KiteAdapter(KiteConfig(account_id="acct", api_key="key"), transport=lambda _op, _payload: next(responses))
+    assert ProviderSyncService(db).sync(adapter)["status"] == "succeeded"
+    second = ProviderSyncService(db).sync(adapter)
+    assert second["status"] == "error"
+    assert second["error"]["code"] == "normalization_error"
+    assert [row["symbol"] for row in db.list_provider_holdings(broker_id="kite", account_id="acct")] == ["INFY"]
+
+
 def test_unconfigured_and_stale_connector_errors_are_safe(tmp_path):
     db = _db(tmp_path)
     unconfigured = KiteAdapter(KiteConfig(account_id="acct", api_key="key"))

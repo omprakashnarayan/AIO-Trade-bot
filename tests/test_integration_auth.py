@@ -82,9 +82,9 @@ def test_integrations_page_has_only_mcp_controls():
 
 def test_indmoney_handoff_and_write_rejected(monkeypatch, tmp_path):
     c = client(monkeypatch, tmp_path)
-    handoff = c.get("/integrations/indmoney/connect")
-    assert handoff.status_code == 200
-    assert "https://mcp.indmoney.com/mcp" in handoff.get_data(as_text=True)
+    handoff = c.get("/integrations/indmoney/connect", follow_redirects=False)
+    assert handoff.status_code == 302
+    assert handoff.location.endswith("/integrations/indmoney/start")
     rejected = c.post("/api/integrations/indmoney/write", headers={"X-CSRF-Token": csrf(c)})
     assert rejected.status_code == 405
     assert c.get("/api/integrations").get_json()["integrations"]["indmoney"]["connected"] is False

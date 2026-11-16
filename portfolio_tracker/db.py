@@ -1022,6 +1022,9 @@ class Database:
     def list_provider_holdings(self, *, broker_id: str, account_id: str) -> list[sqlite3.Row]:
         with self.connect() as conn: return conn.execute("SELECT * FROM provider_holdings WHERE broker_id=? AND account_id=? ORDER BY symbol", (broker_id, account_id)).fetchall()
 
+    def list_provider_positions(self, *, broker_id: str, account_id: str) -> list[sqlite3.Row]:
+        with self.connect() as conn: return conn.execute("SELECT * FROM provider_positions WHERE broker_id=? AND account_id=? ORDER BY symbol", (broker_id, account_id)).fetchall()
+
     def list_provider_cash(self, *, broker_id: str, account_id: str) -> list[sqlite3.Row]:
         with self.connect() as conn: return conn.execute("SELECT * FROM provider_cash WHERE broker_id=? AND account_id=? ORDER BY currency", (broker_id, account_id)).fetchall()
 

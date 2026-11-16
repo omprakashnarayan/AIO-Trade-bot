@@ -20,6 +20,10 @@ fi
 SESSION_SECRET="${PORTFOLIO_SESSION_SECRET:-}"
 ALLOWED_CIDRS="${PORTFOLIO_ALLOWED_CIDRS:-192.168.200.0/24,127.0.0.1/32}"
 MCP_API_TOKEN="${PORTFOLIO_MCP_API_TOKEN:-}"
+MCP_API_TOKEN_FILE="${PORTFOLIO_MCP_API_TOKEN_FILE:-/mnt/user/personalfiles/work/portfolio-tracker-mcp-token}"
+if [ -z "$MCP_API_TOKEN" ] && [ -s "$MCP_API_TOKEN_FILE" ]; then
+  MCP_API_TOKEN="$(tr -d '\n' < "$MCP_API_TOKEN_FILE")"
+fi
 PUBLIC_HTTPS="${PORTFOLIO_PUBLIC_HTTPS:-1}"
 TRUSTED_HOSTS="${PORTFOLIO_TRUSTED_HOSTS:-findash.deepsort.in,192.168.200.196,127.0.0.1,localhost}"
 SESSION_SECRET_FILE="${PORTFOLIO_SESSION_SECRET_FILE:-/mnt/user/personalfiles/work/portfolio-tracker-session-secret}"

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from math import isfinite
 
 from .config import REPORTS_DIR, load_settings
 from .db import Database
+from .market_data import MarketDataService
 from .prices import fetch_prices
 from .recommendations import build_recommendations
 
@@ -16,6 +18,21 @@ def _fmt_money(value: float, currency: str = "$") -> str:
 
 def _fmt_pct(value: float) -> str:
     return f"{value:+.2f}%"
+
+
+def _verified_quote(info: dict, currency: str, max_age_seconds: int = 900) -> float | None:
+    """Only a positive, dated quote explicitly denominated in the holding currency is a mark."""
+    if not isinstance(info, dict) or str(info.get("currency", "")).upper() != currency:
+        return None
+    try:
+        price = float(info["price"])
+        as_of = datetime.fromisoformat(str(info["as_of"]).replace("Z", "+00:00"))
+        age = datetime.now(timezone.utc) - as_of
+    except (KeyError, ValueError, TypeError, OverflowError):
+        return None
+    if as_of.tzinfo is None or not isfinite(price) or price <= 0 or not timedelta(0) <= age <= timedelta(seconds=max_age_seconds):
+        return None
+    return price
 
 
 def portfolio_snapshot(db: Database) -> dict:
@@ -31,10 +48,12 @@ def portfolio_snapshot(db: Database) -> dict:
         }
 
     by_portfolio: dict[str, list[dict]] = defaultdict(list)
-    currency_by_portfolio: dict[str, str] = {}
+    saved_quotes = {}
+    for quote in db.list_market_quotes(limit=500):
+        saved_quotes.setdefault((quote["symbol"].upper(), quote["currency"].upper()), dict(quote))
+    max_age_seconds = MarketDataService(db).stale_after_seconds
     for row in holdings_rows:
         by_portfolio[row["portfolio"]].append(dict(row))
-        currency_by_portfolio[row["portfolio"]] = row["currency"]
 
     portfolio_sections: list[dict] = []
     for portfolio_name, rows in sorted(by_portfolio.items()):
@@ -43,7 +62,8 @@ def portfolio_snapshot(db: Database) -> dict:
         holdings: list[dict] = []
         total_value = 0.0
         total_cost = 0.0
-        currency = currency_by_portfolio.get(portfolio_name, rows[0].get("currency", "INR"))
+        currencies = {row["currency"].upper() for row in rows}
+        currency = next(iter(currencies)) if len(currencies) == 1 else "MIXED"
 
         for row in rows:
             symbol = row["symbol"]
@@ -51,11 +71,12 @@ def portfolio_snapshot(db: Database) -> dict:
             avg_cost = float(row["avg_cost"])
             cached = db.get_price_cache(portfolio_name, symbol)
             price_info = live_prices.get(symbol, {})
-            current_price = price_info.get("price")
-            source = price_info.get("source") or (cached["source"] if cached else "cache")
-            if current_price is None and cached:
-                current_price = float(cached["price"])
-                source = f"cache:{cached['source']}"
+            current_price = _verified_quote(price_info, row["currency"].upper(), max_age_seconds)
+            if current_price is None:
+                price_info = saved_quotes.get((symbol.upper(), row["currency"].upper()), {})
+                current_price = _verified_quote(price_info, row["currency"].upper(), max_age_seconds)
+            source = (price_info.get("source") or "verified") if current_price is not None else "unavailable"
+            # Legacy cache records have no currency: they cannot establish a safe mark.
             if current_price is not None:
                 db.set_price_cache(
                     portfolio_name,
@@ -64,15 +85,15 @@ def portfolio_snapshot(db: Database) -> dict:
                     price_info.get("as_of") or datetime.now(timezone.utc).isoformat(),
                     source,
                 )
-            market_value = (current_price or 0.0) * shares
+            market_value = current_price * shares if current_price is not None else None
             cost_basis = avg_cost * shares
-            gain = market_value - cost_basis
+            gain = market_value - cost_basis if market_value is not None else None
             holdings.append(
                 {
                     "portfolio": portfolio_name,
                     "symbol": symbol,
                     "label": row["label"],
-                    "currency": currency,
+                    "currency": row["currency"].upper(),
                     "shares": shares,
                     "avg_cost": avg_cost,
                     "current_price": current_price,
@@ -80,23 +101,25 @@ def portfolio_snapshot(db: Database) -> dict:
                     "market_value": market_value,
                     "cost_basis": cost_basis,
                     "gain": gain,
-                    "gain_pct": (gain / cost_basis * 100.0) if cost_basis else 0.0,
-                    "day_change_pct": None if current_price is None else _infer_day_change_pct(symbol, current_price, cached, live_prices),
+                    "gain_pct": (gain / cost_basis * 100.0) if gain is not None and cost_basis else (0.0 if gain is not None else None),
+                    "day_change_pct": None,  # cache has no currency metadata for safe comparison
                 }
             )
-            total_value += market_value
+            if market_value is not None:
+                total_value += market_value
             total_cost += cost_basis
 
+        complete = len(currencies) == 1 and all(item["market_value"] is not None for item in holdings)
         for item in holdings:
-            item["weight"] = (item["market_value"] / total_value) if total_value else 0.0
+            item["weight"] = (item["market_value"] / total_value) if complete and total_value else None
 
         summary = {
             "portfolio": portfolio_name,
             "currency": currency,
-            "total_value": total_value,
-            "total_cost": total_cost,
-            "gain": total_value - total_cost,
-            "gain_pct": ((total_value - total_cost) / total_cost * 100.0) if total_cost else 0.0,
+            "total_value": total_value if complete else None,
+            "total_cost": total_cost if len(currencies) == 1 else None,
+            "gain": total_value - total_cost if complete else None,
+            "gain_pct": ((total_value - total_cost) / total_cost * 100.0) if total_cost and complete else (0.0 if complete else None),
             "positions": len(holdings),
         }
         portfolio_sections.append(
@@ -105,7 +128,7 @@ def portfolio_snapshot(db: Database) -> dict:
                 "currency": currency,
                 "summary": summary,
                 "holdings": holdings,
-                "recommendations": build_recommendations(summary, holdings, settings),
+                "recommendations": build_recommendations(summary, [{**item, "weight": item["weight"] or 0.0} for item in holdings], settings),
             }
         )
 
@@ -151,17 +174,20 @@ def render_markdown_report(snapshot: dict) -> str:
         summary = section["summary"]
         lines.append(f"## {section['portfolio']}")
         lines.append(f"_Currency: {currency}_")
-        lines.append(f"- Total value: {_fmt_money(summary['total_value'], currency)}")
-        lines.append(f"- Cost basis: {_fmt_money(summary['total_cost'], currency)}")
-        lines.append(f"- Gain/loss: {_fmt_money(summary['gain'], currency)} ({_fmt_pct(summary['gain_pct'])})")
+        money = lambda value, unit=currency: _fmt_money(value, unit) if value is not None else "n/a"
+        pct = lambda value: _fmt_pct(value) if value is not None else "n/a"
+        lines.append(f"- Total value: {money(summary['total_value'])}")
+        lines.append(f"- Cost basis: {money(summary['total_cost'])}")
+        lines.append(f"- Gain/loss: {money(summary['gain'])} ({pct(summary['gain_pct'])})")
         lines.append(f"- Positions: {summary['positions']}")
         lines.append("")
         lines.append("### Holdings")
         for item in section["holdings"]:
-            cp = "n/a" if item["current_price"] is None else _fmt_money(item["current_price"], currency)
+            unit = item["currency"]
+            cp = money(item["current_price"], unit)
             display_name = f"{item['label']} ({item['symbol']})" if item.get("label") else item["symbol"]
             lines.append(
-                f"- {display_name}: {item['shares']:.4f} shares | price {cp} | value {_fmt_money(item['market_value'], currency)} | weight {_fmt_pct(item['weight']*100)} | P/L {_fmt_money(item['gain'], currency)} ({_fmt_pct(item['gain_pct'])})"
+                f"- {display_name}: {item['shares']:.4f} shares | price {cp} | value {money(item['market_value'], unit)} | weight {pct(item['weight']*100 if item['weight'] is not None else None)} | P/L {money(item['gain'], unit)} ({pct(item['gain_pct'])})"
             )
         lines.append("")
         lines.append("### Long-term ideas")

@@ -174,6 +174,8 @@ class ProviderSyncService:
             if not isinstance(response, Mapping):
                 raise ValueError("provider snapshot must be a mapping")
             snapshot = normalize_provider_snapshot(meta.provider_name, meta.broker_id, meta.account_id, response, source=meta.provider_name)
+            if not snapshot.holdings_complete and self.db.list_provider_holdings(broker_id=meta.broker_id, account_id=meta.account_id):
+                raise ValueError("provider holdings read is incomplete; cached rows retained")
             previous = self.db.prior_provider_state(meta.broker_id, meta.account_id)
             counts = self.db.upsert_provider_snapshot(snapshot)
             # Provider fills become broker-scoped ledger events only; paper state is never touched.
