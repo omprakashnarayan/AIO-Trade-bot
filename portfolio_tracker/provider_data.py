@@ -174,6 +174,7 @@ class ProviderSyncService:
             if not isinstance(response, Mapping):
                 raise ValueError("provider snapshot must be a mapping")
             snapshot = normalize_provider_snapshot(meta.provider_name, meta.broker_id, meta.account_id, response, source=meta.provider_name)
+            previous = self.db.prior_provider_state(meta.broker_id, meta.account_id)
             counts = self.db.upsert_provider_snapshot(snapshot)
             # Provider fills become broker-scoped ledger events only; paper state is never touched.
             from .ledger import FinancialEvent, record_event
@@ -181,7 +182,7 @@ class ProviderSyncService:
                 side = str(fill.raw.get("side", "")).lower()
                 if side in {"buy", "sell"}:
                     record_event(self.db, FinancialEvent(event_type=side, namespace="broker", broker_id=meta.broker_id, account_id=meta.account_id, portfolio=meta.account_id or meta.broker_id, symbol=fill.symbol, quantity=fill.quantity, price=fill.price, currency=fill.currency, event_date=(fill.filled_at or snapshot.captured_at), source=meta.provider_name, external_id=fill.provider_fill_id, source_timestamp=fill.filled_at, metadata=dict(fill.raw)))
-            reconciliation = self.db.reconcile_provider_snapshot(snapshot)
+            reconciliation = self.db.reconcile_provider_snapshot(snapshot, previous=previous)
             finished = now_utc()
             self.db.finish_provider_sync_run(run_id, status="succeeded", finished_at=finished, error=None, counts=counts, reconciliation_id=reconciliation["id"])
             return {"run_id": run_id, "status": "succeeded", "source": snapshot.source, "captured_at": snapshot.captured_at, "counts": counts, "reconciliation": reconciliation}

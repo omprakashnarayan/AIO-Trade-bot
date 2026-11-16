@@ -81,12 +81,15 @@ def test_missing_read_tool_and_write_tool_are_not_executed(tmp_path):
 def test_kite_numeric_pagination_uses_discovered_schema_and_collects_pages(tmp_path):
     args = {'from': {'type':'number'}, 'limit': {'type':'number'}}
     a, opener = adapter('kite', [tool('get_holdings', args),tool('get_positions')], [
-        text([{'tradingsymbol':'INFY','quantity':2}]),text([]),text({'net':[{'tradingsymbol':'TCS','quantity':1}],'day':[]})])
+        text({'data':[{'tradingsymbol':'INFY','quantity':2}], 'pagination':{'from':0,'limit':100,'total':2,'returned':1,'has_more':True}}),
+        text({'data':[{'tradingsymbol':'RELIANCE','quantity':3}], 'pagination':{'from':1,'limit':100,'total':2,'returned':1,'has_more':False}}),
+        text([{'tradingsymbol':'TCS','quantity':1}])])
     db = Database(tmp_path / 'db.sqlite'); db.init_db()
     assert ProviderSyncService(db).sync(a)['status'] == 'succeeded'
     calls = [c['params'] for c in opener.calls if c['method']=='tools/call']
     assert calls[0]['arguments'] == {'from':0,'limit':100}
     assert calls[1]['arguments'] == {'from':1,'limit':100}
+    assert [r['symbol'] for r in db.list_provider_holdings(broker_id='kite', account_id='acct')] == ['INFY','RELIANCE']
 
 
 def test_indmoney_discovery_does_not_infer_undocumented_response_shape(tmp_path):
@@ -138,9 +141,21 @@ def test_bad_row_or_second_tool_failure_preserves_existing_snapshot(tmp_path, pr
         assert conn.execute('SELECT count(*) FROM provider_reconciliations').fetchone()[0] == 0
 
 
-def test_empty_positions_read_is_not_a_complete_sync(tmp_path):
+def test_explicitly_empty_positions_are_valid_when_holdings_are_present(tmp_path):
     db = Database(tmp_path / 'db.sqlite'); db.init_db()
     a, _ = adapter('kite', [tool('get_holdings'), tool('get_positions')], [text([{'tradingsymbol':'INFY','quantity':2}]), text({'net':[], 'day':[]})])
+    assert ProviderSyncService(db).sync(a)['status'] == 'succeeded'
+    assert [r['symbol'] for r in db.list_provider_holdings(broker_id='kite', account_id='acct')] == ['INFY']
+
+
+@pytest.mark.parametrize('page', [
+    {'data':[{'tradingsymbol':'INFY','quantity':2}], 'pagination':{'from':1,'limit':100,'total':2,'returned':1,'has_more':False}},
+    {'data':[{'tradingsymbol':'INFY','quantity':2}], 'pagination':{'from':0,'limit':100,'total':2,'returned':1,'has_more':False}},
+    {'data':[], 'pagination':{'from':0,'limit':100,'total':2,'returned':0,'has_more':True}},
+])
+def test_kite_inconsistent_pagination_cannot_complete_sync(tmp_path, page):
+    a, _ = adapter('kite', [tool('get_holdings', {'from':{'type':'number'}, 'limit':{'type':'number'}}),tool('get_positions')], [text(page)])
+    db = Database(tmp_path/'db.sqlite'); db.init_db()
     assert ProviderSyncService(db).sync(a)['status'] == 'error'
     assert db.list_provider_holdings(broker_id='kite', account_id='acct') == []
 
@@ -153,3 +168,18 @@ def test_complete_sync_prunes_only_matching_account(tmp_path):
     assert ProviderSyncService(db).sync(a)['status'] == 'succeeded'
     assert [r['symbol'] for r in db.list_provider_holdings(broker_id='kite',account_id='acct')] == ['NEW']
     assert [r['symbol'] for r in db.list_provider_holdings(broker_id='kite',account_id='other')] == ['OLD']
+
+
+def test_reconciliation_compares_prior_verified_provider_snapshot(tmp_path):
+    db = Database(tmp_path/'db.sqlite'); db.init_db()
+    def sync(quantity):
+        a, _ = adapter('upstox', [tool('get-holdings'), tool('get-positions')], [
+            text({'status':'success','data':[{'trading_symbol':'INFY','quantity':quantity}]}),
+            text({'status':'success','data':[{'trading_symbol':'TCS','quantity':1}]})])
+        return ProviderSyncService(db).sync(a)
+    first = sync(1)
+    second = sync(2)
+    third = sync(2)
+    assert [run['status'] for run in (first, second, third)] == ['succeeded'] * 3
+    assert [run['reconciliation']['status'] for run in (first, second, third)] == ['unavailable', 'mismatch', 'matched']
+    assert second['reconciliation']['holding_changes'] == {'INFY': {'previous':'1','current':'2'}}

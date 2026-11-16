@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from urllib.parse import parse_qs, urlsplit
 
 from werkzeug.security import generate_password_hash
 
@@ -34,11 +35,22 @@ def test_config_requires_csrf_and_redacts_secrets(monkeypatch, tmp_path):
 
 def test_mcp_connect_never_starts_legacy_oauth(monkeypatch, tmp_path):
     c = client(monkeypatch, tmp_path)
+    monkeypatch.setattr(integration_auth, "fetch_metadata", lambda *args, **kwargs: {
+        "authorization_endpoint": "https://mcp.kite.trade/authorize",
+        "token_endpoint": "https://mcp.kite.trade/token",
+        "registration_endpoint": "https://mcp.kite.trade/register",
+        "scopes_supported": ["default"],
+    })
+    monkeypatch.setattr(integration_auth, "_post_json", lambda *args, **kwargs: {"client_id": "public-mcp-client"})
     token = csrf(c)
     response = c.post("/api/integrations/kite/connect", headers={"X-CSRF-Token": token})
-    assert response.status_code == 409
-    assert response.get_json()["status"] == "authorization_required"
-    assert response.get_json()["mcp_endpoint"] == "https://mcp.kite.trade/mcp"
+    assert response.status_code == 302
+    target = urlsplit(response.headers["Location"])
+    assert (target.scheme, target.netloc, target.path) == ("https", "mcp.kite.trade", "/authorize")
+    query = parse_qs(target.query)
+    assert query["client_id"] == ["public-mcp-client"]
+    assert query["code_challenge_method"] == ["S256"]
+    assert "scope" not in query
     with c.session_transaction() as sess:
         assert "oauth_state" not in sess
 

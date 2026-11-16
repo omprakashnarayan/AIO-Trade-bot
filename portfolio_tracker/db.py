@@ -977,10 +977,26 @@ class Database:
                 conn.execute("INSERT INTO provider_fills(broker_id,account_id,provider,source,provider_fill_id,provider_order_id,symbol,quantity,price,currency,filled_at,raw_payload,captured_at,synced_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(broker_id,account_id,provider_fill_id) DO UPDATE SET provider_order_id=excluded.provider_order_id,symbol=excluded.symbol,quantity=excluded.quantity,price=excluded.price,currency=excluded.currency,filled_at=excluded.filled_at,raw_payload=excluded.raw_payload,captured_at=excluded.captured_at,synced_at=excluded.synced_at", (snapshot.broker_id, snapshot.account_id, snapshot.provider, snapshot.source, item.provider_fill_id, item.provider_order_id, item.symbol, str(item.quantity), str(item.price), item.currency, item.filled_at, _canonical_json(item.raw, "provider fill"), snapshot.captured_at, now)); counts["fills"] += 1
         return counts
 
-    def reconcile_provider_snapshot(self, snapshot: Any) -> dict[str, Any]:
-        """Compare the provider snapshot only with its own prior provider namespace."""
+    def prior_provider_state(self, broker_id: str, account_id: str) -> dict[str, dict[str, str]] | None:
+        """Read only a previously successful snapshot in this broker/account scope."""
+        with self.connect() as conn:
+            verified = conn.execute("SELECT 1 FROM provider_sync_runs WHERE broker_id=? AND account_id=? AND status='succeeded' LIMIT 1", (broker_id, account_id)).fetchone()
+            if not verified:
+                return None
+            return {kind: {row["symbol"]: row["quantity"] for row in conn.execute(
+                f"SELECT symbol, quantity FROM provider_{kind} WHERE broker_id=? AND account_id=?", (broker_id, account_id))}
+                for kind in ("holdings", "positions")}
+
+    def reconcile_provider_snapshot(self, snapshot: Any, *, previous: dict[str, dict[str, str]] | None = None) -> dict[str, Any]:
+        """Compare with the prior verified broker snapshot, never manual/paper state."""
         result = {"holding_count": len(snapshot.holdings), "position_count": len(snapshot.positions), "cash_count": len(snapshot.cash), "orders_count": len(snapshot.orders), "fills_count": len(snapshot.fills), "manual_or_paper_mutated": False}
-        status = "matched"
+        for kind in ("holdings", "positions"):
+            old = previous.get(kind, {}) if previous is not None else {}
+            new = {item.symbol: str(item.quantity) for item in getattr(snapshot, kind)}
+            result[kind[:-1] + "_changes"] = {symbol: {"previous": old.get(symbol), "current": new.get(symbol)}
+                for symbol in sorted(old.keys() | new.keys()) if old.get(symbol) != new.get(symbol)} if previous is not None else {}
+        status = ("unavailable" if previous is None else
+                  "mismatch" if result["holding_changes"] or result["position_changes"] else "matched")
         with self.connect() as conn:
             cur = conn.execute("INSERT INTO provider_reconciliations(broker_id,account_id,provider,status,captured_at,created_at,result_json) VALUES(?,?,?,?,?,?,?)", (snapshot.broker_id, snapshot.account_id, snapshot.provider, status, snapshot.captured_at, datetime.now(timezone.utc).isoformat(), _canonical_json(result, "reconciliation result")))
             result["id"] = int(cur.lastrowid); result["status"] = status

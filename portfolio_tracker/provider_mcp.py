@@ -241,10 +241,25 @@ class MCPProviderAdapter:
             for page in range(100 if paged else 1):
                 arguments = {**args, "from": len(rows), "limit": 100} if paged else args
                 response = self.client.call(name, arguments)
+                has_more = False
                 if self.provider_name == "upstox":
                     if not isinstance(response, Mapping) or response.get("status") != "success":
                         raise ValueError("provider read status is not success")
                     response = response.get("data")
+                elif paged:
+                    if not isinstance(response, Mapping) or not isinstance(response.get("pagination"), Mapping):
+                        raise ValueError("provider pagination metadata is missing")
+                    meta = response["pagination"]
+                    data = response.get("data")
+                    valid = (isinstance(data, list) and isinstance(meta.get("has_more"), bool)
+                             and all(type(meta.get(key)) is int for key in ("from", "limit", "total", "returned"))
+                             and meta["from"] == len(rows) and meta["limit"] == 100
+                             and meta["returned"] == len(data) and meta["total"] >= len(rows) + len(data)
+                             and meta["has_more"] == (len(rows) + len(data) < meta["total"]))
+                    if not valid or (meta["has_more"] and not data):
+                        raise ValueError("provider pagination metadata is inconsistent")
+                    has_more = meta["has_more"]
+                    response = data
                 elif kind == "positions" and isinstance(response, Mapping):
                     response = response.get("net")
                 if not isinstance(response, list) or any(not isinstance(row, Mapping) for row in response):
@@ -254,14 +269,14 @@ class MCPProviderAdapter:
                     if not isinstance(symbol, str) or not symbol.strip() or "quantity" not in row:
                         raise ValueError("provider read row is incomplete")
                 rows.extend(response)
-                if not paged or not response:
+                if not has_more:
                     return rows
             raise ValueError("provider read pagination did not complete")
 
         holdings = read(names[0], "holdings")
         positions = read(names[1], "positions")
-        if not holdings or not positions:
-            raise ValueError("provider holdings or positions read is empty")
+        if not holdings:
+            raise ValueError("provider holdings read is empty")
         return {"holdings": holdings, "positions": positions}
 
     def submit_order(self, intent):
