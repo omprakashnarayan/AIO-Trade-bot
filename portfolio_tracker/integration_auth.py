@@ -28,6 +28,12 @@ from .config import APP_DIR, OFFICIAL_MCP_ENDPOINTS, ensure_dirs
 
 PROVIDERS = ("kite", "upstox", "indmoney")
 CAPABILITIES = {name: {"read": True, "status": True, "reconciliation": True, "live_writes": False} for name in PROVIDERS}
+# Metadata hosts reject urllib's default Python user agent. Use the same
+# explicit, provider-compatible HTTP identity for both discovery documents.
+METADATA_USER_AGENT = "Mozilla/5.0"
+# Only explicitly named read scopes are requested. Kite's advertised "default"
+# is not documented as read-only, so it is deliberately not requested.
+READ_SCOPES = {"indmoney": ("portfolio:read", "market:read"), "kite": (), "upstox": ()}
 
 
 def storage_path() -> Path:
@@ -132,7 +138,7 @@ def _official_url(url: str, *, origin: str | None = None) -> urllib.parse.SplitR
 
 def _post(url: str, form: dict[str, str], *, opener=None) -> dict[str, Any]:
     _official_url(url)
-    req = urllib.request.Request(url, data=urllib.parse.urlencode(form).encode(), headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"}, method="POST")
+    req = urllib.request.Request(url, data=urllib.parse.urlencode(form).encode(), headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json", "User-Agent": METADATA_USER_AGENT}, method="POST")
     try:
         with _urlopen(req, timeout=20, opener=opener) as response: return json.loads(response.read().decode())
     except urllib.error.HTTPError as exc:
@@ -141,7 +147,7 @@ def _post(url: str, form: dict[str, str], *, opener=None) -> dict[str, Any]:
 
 def _post_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
     _official_url(url)
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json", "Accept": "application/json"}, method="POST")
+    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json", "Accept": "application/json", "User-Agent": METADATA_USER_AGENT}, method="POST")
     try:
         with _urlopen(req, timeout=20) as response: return json.loads(response.read().decode())
     except urllib.error.HTTPError as exc:
@@ -155,12 +161,13 @@ def fetch_metadata(endpoint: str, *, metadata_url: str | None = None, opener=Non
     protected = f"https://{origin}/.well-known/oauth-protected-resource{resource.path.rstrip('/')}"
     # RFC 8414 inserts the well-known segment before an issuer's path.
     default_auth = f"https://{origin}/.well-known/oauth-authorization-server"
-    candidates = [metadata_url] if metadata_url else [protected, default_auth]
+    root_protected = f"https://{origin}/.well-known/oauth-protected-resource"
+    candidates = [metadata_url] if metadata_url else [protected, root_protected, default_auth]
     last_error = None
 
     def get(url: str) -> dict[str, Any]:
         _official_url(url, origin=origin)
-        with _urlopen(urllib.request.Request(url, headers={"Accept": "application/json"}), timeout=10, opener=opener) as response:
+        with _urlopen(urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": METADATA_USER_AGENT}), timeout=10, opener=opener) as response:
             payload = json.loads(response.read().decode())
         if not isinstance(payload, dict): raise RuntimeError("OAuth metadata is invalid")
         return payload
@@ -182,8 +189,13 @@ def fetch_metadata(endpoint: str, *, metadata_url: str | None = None, opener=Non
         if not url: continue
         try:
             payload = get(url)
-            if url == protected or "authorization_servers" in payload or "resource" in payload:
-                if payload.get("resource") != endpoint:
+            if url in (protected, root_protected) or "authorization_servers" in payload or "resource" in payload:
+                # Upstox publishes both a path-specific and a base resource;
+                # no other resource URI (including another path) is trusted.
+                expected_resources = {endpoint}
+                if endpoint == OFFICIAL_MCP_ENDPOINTS["upstox"]["url"]:
+                    expected_resources.add("https://mcp.upstox.com")
+                if payload.get("resource") not in expected_resources:
                     raise RuntimeError("OAuth protected resource mismatch")
                 servers = payload.get("authorization_servers") or []
                 if not isinstance(servers, list) or not servers:
@@ -225,11 +237,15 @@ def begin_oauth(secret_key: str | bytes, provider: str, *, session_id: str, redi
     if not client_id: raise RuntimeError("OAuth client registration is required but no registration endpoint was provided")
     auth = authorization_url or metadata.get("authorization_endpoint")
     if not auth: raise RuntimeError("provider authorization URL is not configured")
+    _official_url(auth, origin=_official_url(endpoint).netloc)
     data = _load(secret_key); data.setdefault("oauth", {})[state] = {"provider": provider, "session_id": session_id, "code_verifier": verifier, "redirect_uri": redirect_uri, "client_id": client_id, "created_at": time.time()}
     _save(secret_key, data)
     query = {"response_type": "code", "client_id": client_id, "redirect_uri": redirect_uri, "state": state, "code_challenge": challenge, "code_challenge_method": "S256"}
-    scopes = metadata.get("scopes_supported") or metadata.get("scope")
-    if scopes: query["scope"] = " ".join(scopes) if isinstance(scopes, list) else str(scopes)
+    advertised = metadata.get("scopes_supported") or metadata.get("scope") or ()
+    if isinstance(advertised, str): advertised = advertised.split()
+    if not isinstance(advertised, (list, tuple)): advertised = ()
+    scopes = [scope for scope in READ_SCOPES[provider] if scope in advertised]
+    if scopes: query["scope"] = " ".join(scopes)
     return auth + ("&" if "?" in auth else "?") + urllib.parse.urlencode(query)
 
 
@@ -241,6 +257,7 @@ def _consume_state(secret_key: str | bytes, state: str, provider: str, session_i
 
 
 def complete_oauth(secret_key: str | bytes, provider: str, *, state: str, code: str, session_id: str, token_endpoint: str) -> dict[str, Any]:
+    _official_url(token_endpoint, origin=_official_url(OFFICIAL_MCP_ENDPOINTS[provider]["url"]).netloc)
     item = _consume_state(secret_key, state, provider, session_id)
     payload = _post(token_endpoint, {"grant_type": "authorization_code", "code": code, "redirect_uri": item["redirect_uri"], "client_id": item["client_id"], "code_verifier": item["code_verifier"]})
     return _store_tokens(secret_key, provider, payload, session_id=session_id)

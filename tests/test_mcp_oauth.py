@@ -15,7 +15,7 @@ class Resp:
 def test_pkce_state_storage_callback_and_redaction(monkeypatch, tmp_path):
     monkeypatch.setenv("PORTFOLIO_INTEGRATIONS_PATH", str(tmp_path / "i.enc"))
     secret = "session-secret"
-    meta = {"authorization_endpoint": "https://auth.example/authorize", "token_endpoint": "https://auth.example/token", "registration_endpoint": "https://auth.example/register"}
+    meta = {"authorization_endpoint": "https://mcp.indmoney.com/authorize", "token_endpoint": "https://mcp.indmoney.com/token", "registration_endpoint": "https://mcp.indmoney.com/register"}
     url = integration_auth.begin_oauth(secret, "indmoney", session_id="sid", redirect_uri="https://app/cb", metadata={**meta, "client_id": "cid"})
     from urllib.parse import parse_qs, urlparse
     query = parse_qs(urlparse(url).query)
@@ -44,7 +44,7 @@ def test_browser_route_uses_metadata_registration_and_callback(monkeypatch, tmp_
     monkeypatch.setenv("PORTFOLIO_ADMIN_USERNAME", "admin")
     monkeypatch.setenv("PORTFOLIO_ADMIN_PASSWORD_HASH", generate_password_hash("secret"))
     monkeypatch.setenv("PORTFOLIO_INTEGRATIONS_PATH", str(tmp_path / "route.enc"))
-    monkeypatch.setattr(integration_auth, "fetch_metadata", lambda *a, **k: {"authorization_endpoint": "https://auth.example/authorize", "token_endpoint": "https://auth.example/token", "registration_endpoint": "https://auth.example/register"})
+    monkeypatch.setattr(integration_auth, "fetch_metadata", lambda *a, **k: {"authorization_endpoint": "https://mcp.indmoney.com/authorize", "token_endpoint": "https://mcp.indmoney.com/token", "registration_endpoint": "https://mcp.indmoney.com/register"})
     monkeypatch.setattr(integration_auth, "_post_json", lambda *a, **k: {"client_id": "dynamic-public-client"})
     monkeypatch.setattr(integration_auth, "_post", lambda *a, **k: {"access_token": "access", "refresh_token": "refresh", "expires_in": 3600})
     c = web.app.test_client()
