@@ -59,6 +59,41 @@ def test_published_read_pairs_preserve_distinct_rows_and_scope(tmp_path, provide
     assert [c['params']['name'] for c in opener.calls if c['method']=='tools/call'] == list(names)
 
 
+def test_kite_hosted_portfolio_router_reads_only_holdings_and_positions(tmp_path):
+    schema = {'mode': {'type':'string','enum':['profile','margins','holdings','positions']},
+              'type': {'type':'string','enum':['full','summary','compact']},
+              'from': {'type':'integer'}, 'limit': {'type':'integer'}, '_app_request_id':{'type':'string'}}
+    t = tool('portfolio', schema);t['inputSchema']['required']=['mode']
+    a, opener = adapter('kite', [t,tool('orders')], [
+        text({'data':[{'tradingsymbol':'INFY','quantity':2,'average_price':100}], 'pagination':{'from':0,'limit':100,'total':1,'returned':1,'has_more':False}}),
+        text({'data':[], 'pagination':{'from':0,'limit':100,'total':0,'returned':0,'has_more':False}})])
+    db = Database(tmp_path/'db.sqlite');db.init_db()
+    result=ProviderSyncService(db).sync(a)
+    assert result['status']=='succeeded', result
+    assert [r['symbol'] for r in db.list_provider_holdings(broker_id='kite',account_id='acct')]==['INFY']
+    calls=[c['params'] for c in opener.calls if c['method']=='tools/call']
+    assert calls==[{'name':'portfolio','arguments':{'mode':'holdings','type':'full','from':0,'limit':100}},
+                   {'name':'portfolio','arguments':{'mode':'positions','from':0,'limit':100}}]
+    assert 'orders' not in a.client.tools
+
+
+def test_indmoney_us_holdings_are_separate_and_keep_broker_provenance(tmp_path):
+    t=tool('networth_holdings',{'asset_type':{'type':'string','enum':['IND_STOCK','US_STOCK']},
+                                'family_member':{'anyOf':[{'type':'string'},{'type':'null'}]}})
+    t['inputSchema']['required']=['asset_type']
+    a, opener=adapter('indmoney',[t,tool('save_analysis')],[text({'source_status':{'holdings':'success'},
+        'asset_summary':{'total_value_usd':500.0},'holdings':[{'asset_type':'US_STOCK','investment_code':'MSFT',
+        'total_units':2.0,'invested_value_usd':400.0,'current_value_usd':500.0,'broker':'linked-broker'}]})])
+    db=Database(tmp_path/'db.sqlite');db.init_db()
+    result=ProviderSyncService(db).sync(a)
+    assert result['status']=='succeeded', result
+    rows=db.list_provider_holdings(broker_id='indmoney',account_id='acct')
+    assert [(r['symbol'],r['quantity'],r['average_price'],r['currency'],r['provider_id'],r['source']) for r in rows]==[('MSFT','2.0','200','USD','linked-broker','indmoney')]
+    assert db.list_provider_holdings(broker_id='upstox',account_id='acct')==[]
+    assert [c['params'] for c in opener.calls if c['method']=='tools/call']==[{'name':'networth_holdings','arguments':{'asset_type':'US_STOCK'}}]
+    assert 'save_analysis' not in a.client.tools
+
+
 @pytest.mark.parametrize('payload', [{}, {'status':'error','data':[{'symbol':'INFY','quantity':2}]}, {'status':'success','data':[]}, {'status':'success','data':[{'symbol':'INFY'}]}, {'data':{'holdings':[]}}, {'holdings':[{'symbol':'INFY','quantity':1}]}])
 def test_malformed_empty_and_partial_never_persist_or_succeed(tmp_path, payload):
     db = Database(tmp_path / 'db.sqlite'); db.init_db()

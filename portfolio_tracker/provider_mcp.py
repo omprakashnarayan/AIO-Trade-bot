@@ -7,6 +7,7 @@ for every provider read.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 import json
 import re
 import ssl
@@ -25,6 +26,7 @@ _PORTFOLIO_READ_TOOLS = frozenset((
     "snapshot", "portfolio_snapshot", "get_portfolio_snapshot",
     "holdings", "get_holdings", "positions", "get_positions",
     "get-holdings", "get-positions",
+    "portfolio", "networth_holdings",
 ))
 _WRITE_SEMANTICS = re.compile(
     r"\b(?:buy|sell|place|submit|execute|cancel|modify|"
@@ -52,6 +54,32 @@ def _safe_read_schema(schema: Mapping[str, Any], *, pagination: bool = False) ->
         if key in properties and (not isinstance(properties[key], Mapping) or properties[key].get("type") not in ("number", "integer")):
             return False
     return True
+
+
+def _approved_read_schema(provider: str, name: str, schema: Mapping[str, Any]) -> bool:
+    """Allow only the observed read modes of hosted provider routers."""
+    properties = schema.get("properties", {})
+    required = schema.get("required", [])
+    if schema.get("type", "object") != "object" or not isinstance(properties, Mapping) or not isinstance(required, list):
+        return False
+    if name == "portfolio":
+        if provider != "kite" or set(properties) - {"mode", "type", "from", "limit", "_app_request_id"} or set(required) != {"mode"}:
+            return False
+        mode, typ = properties.get("mode"), properties.get("type")
+        if (not isinstance(mode, Mapping) or mode.get("type") != "string"
+                or not {"holdings", "positions"} <= set(mode.get("enum", []))
+                or set(mode.get("enum", [])) - {"profile", "margins", "holdings", "positions"}
+                or not isinstance(typ, Mapping) or typ.get("type") != "string" or "full" not in typ.get("enum", [])):
+            return False
+        return all(isinstance(properties.get(key), Mapping) and properties[key].get("type") in ("integer", "number")
+                   for key in ("from", "limit"))
+    if name == "networth_holdings":
+        asset = properties.get("asset_type")
+        return (provider == "indmoney" and set(properties) <= {"asset_type", "family_member"}
+                and set(required) == {"asset_type"} and isinstance(asset, Mapping)
+                and asset.get("type") == "string" and "US_STOCK" in asset.get("enum", []))
+    return name not in {"portfolio", "networth_holdings"} and _safe_read_schema(
+        schema, pagination=provider == "kite" and name in {"get_holdings", "get_positions"})
 
 
 def redact(value: Any) -> Any:
@@ -125,10 +153,21 @@ class MCPClient:
         except (TimeoutError, urllib.error.URLError, OSError):
             raise BrokerAdapterError("mcp_timeout", "provider MCP request timed out or failed", provider=self.provider, retryable=True) from None
         try:
-            # Streamable HTTP may return a single JSON object or SSE data lines.
-            if raw.lstrip().startswith("data:"):
-                raw = next(line[5:].strip() for line in raw.splitlines() if line.startswith("data:"))
-            result = json.loads(raw)
+            # Streamable HTTP may put a JSON-RPC response in an SSE event,
+            # preceded by `event: message` and unrelated server notifications.
+            if raw.lstrip().startswith(("event:", "data:", ":", "id:")):
+                events, lines = [], []
+                for line in [*raw.splitlines(), ""]:
+                    if not line:
+                        if lines: events.append("\n".join(lines)); lines = []
+                    elif line.startswith("data:"):
+                        lines.append(line[5:].lstrip(" "))
+                result = next((item for event in events if isinstance((item := json.loads(event)), Mapping)
+                               and item.get("id") == request_id), None)
+                if result is None: raise ValueError("SSE response did not match request")
+            else:
+                result = json.loads(raw)
+            if not isinstance(result, Mapping): raise ValueError("JSON-RPC response is not an object")
         except (TypeError, ValueError, StopIteration):
             raise BrokerAdapterError("mcp_invalid_json", "provider MCP returned invalid JSON-RPC", provider=self.provider) from None
         if "error" in result:
@@ -162,7 +201,7 @@ class MCPClient:
             description = item.get("description", "")
             if (name not in _PORTFOLIO_READ_TOOLS or not isinstance(description, str)
                     or _WRITE_SEMANTICS.search(description) or not isinstance(schema, Mapping)
-                    or not _safe_read_schema(schema, pagination=self.provider == "kite" and name in {"get_holdings", "get_positions"})):
+                    or not _approved_read_schema(self.provider, name, schema)):
                 continue
             self.tools[name] = DiscoveredTool(name, dict(schema), description)
         self.verified = bool(self.tools)
@@ -183,11 +222,15 @@ class MCPClient:
             raise BrokerAdapterError("mcp_tool_arguments_invalid", "provider MCP read arguments are invalid", provider=self.provider)
         args = dict(arguments or {})
         properties = schema.get("properties", {})
-        if (not _safe_read_schema(schema, pagination=self.provider == "kite" and name in {"get_holdings", "get_positions"}) or set(args) - set(properties)
+        if (not _approved_read_schema(self.provider, name, schema) or set(args) - set(properties)
                 or set(schema.get("required", [])) - set(args)
                 or ("account_id" in args and not isinstance(args["account_id"], str))
                 or any(key in args and (isinstance(args[key], bool) or not isinstance(args[key], (int, float)) or args[key] < 0) for key in ("from", "limit"))
-                or ("limit" in args and args["limit"] == 0)):
+                or ("limit" in args and args["limit"] == 0)
+                or (name == "portfolio" and (args.get("mode") not in {"holdings", "positions"}
+                    or ("type" in args and args["type"] != "full") or "_app_request_id" in args
+                    or ("limit" in args and args["limit"] > 500)))
+                or (name == "networth_holdings" and (args.get("asset_type") != "US_STOCK" or "family_member" in args))):
             raise BrokerAdapterError("mcp_tool_arguments_invalid", "provider MCP read arguments do not match discovered schema", provider=self.provider)
         result = self._rpc("tools/call", {"name": name, "arguments": args})
         if isinstance(result, Mapping) and result.get("isError"):
@@ -228,18 +271,47 @@ class MCPProviderAdapter:
     def sync_snapshot(self) -> Mapping[str, Any]:
         """Require both documented read results before writing any provider state."""
         if not self.client.verified: self.discover()
-        names = {"kite": ("get_holdings", "get_positions"),
-                 "upstox": ("get-holdings", "get-positions")}.get(self.provider_name)
+        if self.provider_name == "indmoney":
+            if "networth_holdings" not in self.client.tools:
+                raise BrokerAdapterError("mcp_snapshot_incomplete", "verified US holdings read is required", provider=self.provider_name)
+            response = self.client.call("networth_holdings", {"asset_type": "US_STOCK"})
+            if (not isinstance(response, Mapping) or not isinstance(response.get("source_status"), Mapping)
+                    or response["source_status"].get("holdings") != "success"
+                    or not isinstance(response.get("holdings"), list) or not response["holdings"]):
+                raise ValueError("INDmoney US holdings read is incomplete")
+            holdings, seen = [], set()
+            for row in response["holdings"]:
+                if not isinstance(row, Mapping) or row.get("asset_type") != "US_STOCK":
+                    raise ValueError("INDmoney US holding has invalid asset type")
+                symbol, broker = row.get("investment_code"), row.get("broker")
+                if (not isinstance(symbol, str) or not re.fullmatch(r"[A-Za-z0-9.\-]{1,32}", symbol)
+                        or symbol.upper() in seen or not isinstance(broker, str) or not broker.strip()):
+                    raise ValueError("INDmoney US holding has ambiguous identity or provenance")
+                seen.add(symbol.upper())
+                try:
+                    quantity = Decimal(str(row["total_units"])); invested = Decimal(str(row["invested_value_usd"]))
+                except (KeyError, InvalidOperation, TypeError, ValueError):
+                    raise ValueError("INDmoney US holding has invalid quantity or cost") from None
+                if not quantity.is_finite() or quantity <= 0 or not invested.is_finite() or invested < 0:
+                    raise ValueError("INDmoney US holding has invalid quantity or cost")
+                holdings.append({"symbol": symbol.upper(), "quantity": str(quantity), "average_price": str(invested / quantity),
+                                 "currency": "USD", "id": broker.strip()})
+            # US tracking has holdings only; it never asserts a live broker position.
+            return {"holdings": holdings, "positions": []}
+        names = ({"kite": ("portfolio", "portfolio") if "portfolio" in self.client.tools else ("get_holdings", "get_positions"),
+                  "upstox": ("get-holdings", "get-positions")}).get(self.provider_name)
         if names is None or any(name not in self.client.tools for name in names):
             raise BrokerAdapterError("mcp_snapshot_incomplete", "verified holdings and positions reads are required", provider=self.provider_name)
 
         def read(name: str, kind: str) -> list[Mapping[str, Any]]:
             properties = self.client.tools[name].input_schema.get("properties", {})
             args = {"account_id": self._account_id} if "account_id" in properties else {}
+            if name == "portfolio": args["mode"] = kind
             paged = self.provider_name == "kite" and {"from", "limit"} <= set(properties)
             rows = []
             for page in range(100 if paged else 1):
-                arguments = {**args, "from": len(rows), "limit": 100} if paged else args
+                arguments = {**args, "from": len(rows), "limit": 100} if paged else dict(args)
+                if name == "portfolio" and kind == "holdings": arguments["type"] = "full"
                 response = self.client.call(name, arguments)
                 has_more = False
                 if self.provider_name == "upstox":

@@ -61,6 +61,28 @@ def test_authenticated_mcp_calls_use_provider_accepted_http_identity():
     assert "get-holdings" in client.discover()
 
 
+def test_streamable_http_sse_matches_rpc_id_after_event_prefix():
+    class SSE:
+        headers = {"MCP-Session-Id": "session-test"}
+        def __init__(self, text): self.text = text
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def read(self): return self.text.encode()
+    class Transport:
+        def __init__(self): self.calls = []
+        def open(self, request, timeout):
+            req = json.loads(request.data); self.calls.append((req["method"], request.get_header("Mcp-session-id")))
+            if req["method"] == "notifications/initialized": return SSE("")
+            result = ({"tools": [{"name":"get_holdings","inputSchema":{"type":"object"}}]}
+                      if req["method"] == "tools/list" else {})
+            body = ("event: message\r\ndata: " + json.dumps({"jsonrpc":"2.0","method":"notifications/progress"}) + "\r\n\r\n"
+                    + "event: message\r\ndata: " + json.dumps({"jsonrpc":"2.0","id":req["id"],"result":result}) + "\r\n\r\n")
+            return SSE(body)
+    transport=Transport();client=MCPClient("https://mcp.kite.trade/mcp",provider="kite",opener=transport)
+    assert "get_holdings" in client.discover()
+    assert transport.calls == [("initialize",None),("notifications/initialized","session-test"),("tools/list","session-test")]
+
+
 def test_published_read_descriptions_do_not_look_like_write_actions():
     tools = [
         {"name": "get-holdings", "description": "Retrieve long-term equity holdings — stocks retained across previous trading sessions — with current value, quantity, average price, and P&L.", "inputSchema": {"$schema":"http://json-schema.org/draft-07/schema#", "type":"object", "properties":{}}},
