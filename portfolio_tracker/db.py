@@ -955,6 +955,16 @@ class Database:
     def upsert_provider_snapshot(self, snapshot: Any) -> dict[str, int]:
         now = datetime.now(timezone.utc).isoformat(); counts = {"holdings": 0, "positions": 0, "cash": 0, "orders": 0, "fills": 0}
         with self.connect() as conn:
+            # Prune only when both provider reads were validated as a complete
+            # snapshot. An absent/partial read must never erase prior data.
+            if snapshot.holdings_complete and snapshot.positions_complete:
+                for table, rows in (("provider_holdings", snapshot.holdings), ("provider_positions", snapshot.positions)):
+                    symbols = [item.symbol for item in rows]
+                    if symbols:
+                        placeholders = ",".join("?" for _ in symbols)
+                        conn.execute(f"DELETE FROM {table} WHERE broker_id=? AND account_id=? AND symbol NOT IN ({placeholders})", (snapshot.broker_id, snapshot.account_id, *symbols))
+                    else:
+                        conn.execute(f"DELETE FROM {table} WHERE broker_id=? AND account_id=?", (snapshot.broker_id, snapshot.account_id))
             for table, rows in (("provider_holdings", snapshot.holdings), ("provider_positions", snapshot.positions)):
                 for item in rows:
                     conn.execute(f"INSERT INTO {table}(broker_id,account_id,provider,source,symbol,provider_id,quantity,average_price,currency,exchange,captured_at,synced_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(broker_id,account_id,symbol) DO UPDATE SET provider=excluded.provider,source=excluded.source,provider_id=excluded.provider_id,quantity=excluded.quantity,average_price=excluded.average_price,currency=excluded.currency,exchange=excluded.exchange,captured_at=excluded.captured_at,synced_at=excluded.synced_at", (snapshot.broker_id, snapshot.account_id, snapshot.provider, snapshot.source, item.symbol, item.provider_id, str(item.quantity), None if item.average_price is None else str(item.average_price), item.currency, item.exchange, snapshot.captured_at, now))

@@ -95,6 +95,8 @@ class ProviderSnapshot:
     cash: tuple[ProviderCash, ...] = ()
     orders: tuple[ProviderOrder, ...] = ()
     fills: tuple[ProviderFill, ...] = ()
+    holdings_complete: bool = False
+    positions_complete: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,14 +127,17 @@ def normalize_provider_snapshot(provider: str, broker_id: str, account_id: str, 
         raise ValueError("provider snapshot data is malformed")
     timestamp = _timestamp(captured_at or response.get("captured_at") or response.get("as_of") or now_utc())
     def holding(row: Mapping[str, Any]) -> ProviderHolding:
-        symbol = _text(row.get("symbol") or row.get("tradingsymbol") or row.get("instrument_token"))
+        symbol = _text(row.get("symbol") or row.get("trading_symbol") or row.get("tradingsymbol") or row.get("instrument_token"))
         if not symbol:
             raise ValueError("provider holding is missing symbol")
         return ProviderHolding(symbol.upper(), _decimal(row.get("quantity", row.get("qty", row.get("net_quantity", 0)))),
                                None if row.get("average_price", row.get("avg_price")) is None else _decimal(row.get("average_price", row.get("avg_price"))),
                                _text(row.get("currency"), "INR").upper(), _text(row.get("exchange")), _text(row.get("instrument_token") or row.get("id")))
-    holdings = tuple(holding(row) for row in _rows(root, "holdings", "positions"))
-    positions = tuple(holding(row) for row in _rows(root, "positions", "holdings"))
+    for key in ("holdings", "positions"):
+        if key in root and (not isinstance(root[key], (list, tuple)) or any(not isinstance(row, Mapping) for row in root[key])):
+            raise ValueError(f"provider {key} rows are malformed")
+    holdings = tuple(holding(row) for row in _rows(root, "holdings"))
+    positions = tuple(holding(row) for row in _rows(root, "positions"))
     cash_rows = _rows(root, "cash", "funds", "balances")
     if not cash_rows and any(k in root for k in ("cash", "balance", "available_cash")):
         cash_rows = [root]
@@ -147,7 +152,7 @@ def normalize_provider_snapshot(provider: str, broker_id: str, account_id: str, 
         fid = _text(row.get("fill_id") or row.get("trade_id") or row.get("id")); oid = _text(row.get("order_id") or row.get("orderId"))
         if not fid or not oid: raise ValueError("provider fill is missing IDs")
         fills.append(ProviderFill(fid, oid, _text(row.get("symbol") or row.get("tradingsymbol")), _decimal(row.get("quantity", row.get("qty"))), _decimal(row.get("price")), _text(row.get("currency"), "INR").upper(), _timestamp(row["filled_at"]) if row.get("filled_at") else None, dict(row)))
-    return ProviderSnapshot(provider, broker_id, account_id, source or provider, timestamp, holdings, positions, cash, tuple(orders), tuple(fills))
+    return ProviderSnapshot(provider, broker_id, account_id, source or provider, timestamp, holdings, positions, cash, tuple(orders), tuple(fills), "holdings" in root and bool(holdings), "positions" in root)
 
 
 class SnapshotAdapter(Protocol):
@@ -164,7 +169,10 @@ class ProviderSyncService:
         started = now_utc()
         run_id = self.db.create_provider_sync_run(meta.broker_id, meta.account_id, meta.provider_name, started_at=started)
         try:
-            response = adapter.snapshot()
+            sync_read = getattr(adapter, "sync_snapshot", None)
+            response = sync_read() if callable(sync_read) else adapter.snapshot()
+            if not isinstance(response, Mapping):
+                raise ValueError("provider snapshot must be a mapping")
             snapshot = normalize_provider_snapshot(meta.provider_name, meta.broker_id, meta.account_id, response, source=meta.provider_name)
             counts = self.db.upsert_provider_snapshot(snapshot)
             # Provider fills become broker-scoped ledger events only; paper state is never touched.
