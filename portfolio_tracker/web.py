@@ -224,8 +224,10 @@ def _provider_adapter(name: str):
         raise ValueError(f"{name} MCP endpoint is unconfigured; no verified official endpoint is available")
     record = integration_auth.get_provider(_integration_secret_key(), name)
     account_id = str(record.get("account_id") or load_settings().get("default_account_id") or "operator")
-    session_id = str(session.get("oauth_session_id", ""))
-    record = integration_auth.get_provider(_integration_secret_key(), name)
+    # The callback state is bound to the initiating browser session, but the
+    # encrypted consent belongs to this authenticated single-operator app.
+    # Re-login must not make a saved token unusable for read-only sync.
+    session_id = str(record.get("oauth_session") or "")
     def token_provider():
         token_endpoint = record.get("token_endpoint")
         refresh = (lambda refresh_token: integration_auth._post(token_endpoint, {"grant_type": "refresh_token", "refresh_token": refresh_token, "client_id": record.get("client_id", "")})) if token_endpoint else None
@@ -859,7 +861,8 @@ def api_integration_sync(name: str):
     try:
         db = Database(); db.init_db(); adapter = _provider_adapter(name); result = ProviderSyncService(db).sync(adapter)
         if result["status"] == "succeeded":
-            integration_auth.mark_mcp_verified(_integration_secret_key(), name, session_id=str(session.get("oauth_session_id", "")), tools=sorted(adapter.client.tools))
+            record = integration_auth.get_provider(_integration_secret_key(), name)
+            integration_auth.mark_mcp_verified(_integration_secret_key(), name, session_id=str(record.get("oauth_session") or ""), tools=sorted(adapter.client.tools))
         if result.get("error", {}).get("code") == "mcp_authorization_required":
             return jsonify({"integration": name, "status": "authorization_required", "error": result["error"], "authorization_url": adapter.client.authorization_url, "live_writes": False}), 409
         return jsonify({"integration": name, **result}), 200 if result["status"] == "succeeded" else 502

@@ -92,3 +92,30 @@ def test_expired_token_refreshes_without_logging(monkeypatch, tmp_path):
     assert token == "new"
     assert "new" not in (tmp_path / "refresh.enc").read_text()
 
+
+def test_authenticated_operator_can_reuse_saved_provider_consent_after_login(monkeypatch, tmp_path):
+    from werkzeug.security import generate_password_hash
+    from portfolio_tracker import web
+    monkeypatch.setenv("PORTFOLIO_INTEGRATIONS_PATH", str(tmp_path / "saved-consent.enc"))
+    monkeypatch.setenv("PORTFOLIO_ADMIN_USERNAME", "admin")
+    monkeypatch.setenv("PORTFOLIO_ADMIN_PASSWORD_HASH", generate_password_hash("secret"))
+    integration_auth._store_tokens(str(web.app.secret_key), "upstox", {"access_token":"saved-token", "expires_in":3600}, session_id="previous-login")
+    c = web.app.test_client()
+    assert c.post("/login",data={"username":"admin","password":"secret"}).status_code == 302
+    with c.session_transaction() as sess:
+        assert sess["oauth_session_id"] != "previous-login"
+        csrf = sess["csrf_token"]
+    class DB:
+        def init_db(self): pass
+    class Service:
+        def __init__(self, db): pass
+        def sync(self, adapter):
+            assert adapter.client.token_provider() == "saved-token"
+            adapter.client.tools = {"get-holdings": object(), "get-positions": object()}
+            return {"status":"succeeded", "counts":{"holdings":1}}
+    monkeypatch.setattr(web, "Database", DB)
+    monkeypatch.setattr(web, "ProviderSyncService", Service)
+    r = c.post("/api/integrations/upstox/sync",headers={"X-CSRF-Token":csrf})
+    assert r.status_code == 200
+    assert integration_auth.status(str(web.app.secret_key),"upstox")["connected"] is True
+
