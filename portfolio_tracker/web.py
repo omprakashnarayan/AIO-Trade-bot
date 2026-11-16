@@ -801,16 +801,20 @@ def integration_start(name: str):
     try:
         cfg = oauth_provider_config(name)
         metadata = integration_auth.fetch_metadata(endpoint["url"], metadata_url=cfg["metadata_url"])
+        # Cloudflare Tunnel can forward HTTPS requests to the HTTP origin.
+        # Register the externally visible callback, not the internal scheme.
+        callback_uri = url_for("oauth_callback", name=name, _external=True,
+                               _scheme="https" if os.environ.get("PORTFOLIO_PUBLIC_HTTPS") == "1" else request.scheme)
         client_id = integration_auth.get_provider(_integration_secret_key(), name).get("client_id")
         if not client_id and metadata.get("registration_endpoint"):
-            registration = integration_auth._post_json(metadata["registration_endpoint"], {"client_name": "portfolio-tracker", "redirect_uris": [url_for("oauth_callback", name=name, _external=True)], "token_endpoint_auth_method": "none"})
+            registration = integration_auth._post_json(metadata["registration_endpoint"], {"client_name": "portfolio-tracker", "redirect_uris": [callback_uri], "token_endpoint_auth_method": "none"})
             client_id = registration.get("client_id")
             if not client_id: raise RuntimeError("dynamic client registration returned no client_id")
             integration_auth.save_config(_integration_secret_key(), name, {"client_id": str(client_id), "token_endpoint": str(metadata.get("token_endpoint"))})
         if not client_id: raise RuntimeError("no public OAuth client is configured and dynamic registration is unavailable")
         if not integration_auth.get_provider(_integration_secret_key(), name).get("token_endpoint"):
             integration_auth.save_config(_integration_secret_key(), name, {"token_endpoint": str(metadata["token_endpoint"])})
-        target = integration_auth.begin_oauth(_integration_secret_key(), name, session_id=str(session.get("oauth_session_id", "")), redirect_uri=url_for("oauth_callback", name=name, _external=True), metadata=metadata, authorization_url=cfg["authorization_url"])
+        target = integration_auth.begin_oauth(_integration_secret_key(), name, session_id=str(session.get("oauth_session_id", "")), redirect_uri=callback_uri, metadata=metadata, authorization_url=cfg["authorization_url"])
         return redirect(target)
     except (KeyError, ValueError, RuntimeError, OSError) as exc:
         return jsonify({"status": "authorization_required", "error": redact(str(exc)), "provider": name, "mcp_endpoint": endpoint["url"], "authorization_url": oauth_provider_config(name).get("authorization_url")}), 409

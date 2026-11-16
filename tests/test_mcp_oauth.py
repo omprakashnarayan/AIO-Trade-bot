@@ -60,6 +60,30 @@ def test_browser_route_uses_metadata_registration_and_callback(monkeypatch, tmp_
     assert status["oauth_authorized"] is True and status["connected"] is False
 
 
+def test_public_oauth_callback_stays_https_behind_http_tunnel(monkeypatch, tmp_path):
+    from werkzeug.security import generate_password_hash
+    from portfolio_tracker import web
+    monkeypatch.setenv("PORTFOLIO_PUBLIC_HTTPS", "1")
+    monkeypatch.setenv("PORTFOLIO_ADMIN_USERNAME", "admin")
+    monkeypatch.setenv("PORTFOLIO_ADMIN_PASSWORD_HASH", generate_password_hash("secret"))
+    monkeypatch.setenv("PORTFOLIO_INTEGRATIONS_PATH", str(tmp_path / "oauth.enc"))
+    monkeypatch.setattr(integration_auth, "fetch_metadata", lambda *a, **k: {
+        "authorization_endpoint": "https://mcp.indmoney.com/authorize", "token_endpoint": "https://mcp.indmoney.com/token",
+        "registration_endpoint": "https://mcp.indmoney.com/register"})
+    registered = []
+    def register(url, payload):
+        registered.append(payload["redirect_uris"][0])
+        return {"client_id": "client"}
+    monkeypatch.setattr(integration_auth, "_post_json", register)
+    c = web.app.test_client()
+    assert c.post("/login", base_url="http://findash.deepsort.in", data={"username":"admin","password":"secret"}).status_code == 302
+    r = c.get("/integrations/indmoney/start", base_url="http://findash.deepsort.in")
+    assert r.status_code == 302
+    from urllib.parse import parse_qs, urlsplit
+    assert registered == ["https://findash.deepsort.in/oauth/indmoney/callback"]
+    assert parse_qs(urlsplit(r.location).query)["redirect_uri"] == registered
+
+
 def test_expired_token_refreshes_without_logging(monkeypatch, tmp_path):
     monkeypatch.setenv("PORTFOLIO_INTEGRATIONS_PATH", str(tmp_path / "refresh.enc"))
     secret = "refresh-secret"

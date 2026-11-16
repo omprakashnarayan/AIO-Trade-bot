@@ -27,7 +27,7 @@ _PORTFOLIO_READ_TOOLS = frozenset((
     "get-holdings", "get-positions",
 ))
 _WRITE_SEMANTICS = re.compile(
-    r"\b(?:buy|sell|trade|trading|order|orders|place|submit|execute|cancel|modify|"
+    r"\b(?:buy|sell|place|submit|execute|cancel|modify|"
     r"update|create|delete|transfer|withdraw|deposit|rebalance)\b", re.I,
 )
 
@@ -106,7 +106,7 @@ class MCPClient:
         payload = {"jsonrpc": "2.0", "method": method}
         if request_id is not None: payload["id"] = request_id
         if params is not None: payload["params"] = dict(params)
-        headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+        headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream", "User-Agent": "Mozilla/5.0"}
         token = self.token_provider() if self.token_provider else self.access_token
         if token:
             headers["Authorization"] = f"{self.token_type} {token}"

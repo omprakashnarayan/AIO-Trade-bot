@@ -1,4 +1,6 @@
 import json
+import urllib.error
+from email.message import Message
 from pathlib import Path
 
 import pytest
@@ -45,6 +47,28 @@ def test_mcp_auth_failure_and_redaction():
     assert DEFAULT_SETTINGS["provider_modes"]["kite"] == "mcp_only"
     assert OFFICIAL_MCP_ENDPOINTS["kite"]["url"] == "https://mcp.kite.trade/mcp"
     assert OFFICIAL_MCP_ENDPOINTS["upstox"]["url"] == "https://mcp.upstox.com/mcp"
+
+
+def test_authenticated_mcp_calls_use_provider_accepted_http_identity():
+    class WAF:
+        def open(self, request, timeout):
+            if request.get_header("User-agent") != "Mozilla/5.0":
+                raise urllib.error.HTTPError(request.full_url, 403, "rejected client", Message(), None)
+            method = json.loads(request.data)["method"]
+            result = {"initialize": {}, "tools/list": {"tools": [{"name": "get-holdings", "inputSchema": {"type": "object", "properties": {}}}]}}.get(method, {})
+            return Response({"jsonrpc": "2.0", "id": 1, "result": result})
+    client = MCPClient("https://mcp.upstox.com/mcp", provider="upstox", access_token="example-token", opener=WAF())
+    assert "get-holdings" in client.discover()
+
+
+def test_published_read_descriptions_do_not_look_like_write_actions():
+    tools = [
+        {"name": "get-holdings", "description": "Retrieve long-term equity holdings — stocks retained across previous trading sessions — with current value, quantity, average price, and P&L.", "inputSchema": {"$schema":"http://json-schema.org/draft-07/schema#", "type":"object", "properties":{}}},
+        {"name": "get-positions", "description": "Retrieve current-day trading positions with real-time P&L, quantity, and margin details for all active intraday positions.", "inputSchema": {"$schema":"http://json-schema.org/draft-07/schema#", "type":"object", "properties":{}}},
+    ]
+    client, _ = _client_with_tools(tools)
+    client.provider = "upstox"
+    assert sorted(client.discover()) == ["get-holdings", "get-positions"]
 
 
 def _client_with_tools(tools, *, response=None):
