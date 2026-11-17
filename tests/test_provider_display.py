@@ -61,7 +61,7 @@ def test_dashboard_and_portfolio_api_show_scoped_broker_rows_without_fake_marks(
     assert "initialBrokerHoldings" in html and "location.reload()" in html
 
     payload = client.get("/api/portfolio").get_json()
-    initial = re.search(r'const initialBrokerHoldings=(\[.*?\]);const commands=', html)
+    initial = re.search(r'const initialBrokerHoldings=(\[.*?\]);const initialDashboardStatus=.*?;const commands=', html)
     assert initial and json.loads(initial.group(1)) == payload["broker_holdings"]
     assert payload["snapshot"]["summary"]["positions"] == 0
     assert payload["snapshot"]["portfolios"] == []
@@ -209,3 +209,39 @@ def test_missing_one_currency_mark_keeps_other_currency_mark_for_same_symbol(tmp
     values = {row["currency"]: row["price"] for row in result["positions"]}
     assert values == {"INR": "12", "USD": None}
     assert result["value"] is None
+
+
+def test_dashboard_and_console_snapshot_explain_current_source_coverage(tmp_path, monkeypatch):
+    db, client = _client(tmp_path, monkeypatch)
+    _seed(db, "kite", "INFY", "INR")
+    _seed(db, "upstox", "TCS", "INR")
+    _seed(db, "indmoney", "AAPL", "USD")
+
+    payload = client.get("/api/console/snapshot").get_json()
+    status = payload["data_status"]
+    assert status["broker_totals"] == {"holdings": 3, "positions": 0, "cash": 0, "orders": 0, "fills": 0}
+    workspaces = {item["key"]: item for item in status["workspaces"]}
+    assert workspaces["manual_portfolio"]["count"] == 0
+    assert workspaces["paper_trades"]["count"] == 0
+    assert workspaces["ledger"]["count"] == 0
+    assert workspaces["research"]["count"] == 0
+    assert workspaces["finance"]["count"] == 0
+
+    html = client.get("/").get_data(as_text=True)
+    assert "DATA COVERAGE // CURRENT SOURCE STATUS" in html
+    assert "Broker snapshots" in html and "3 holdings" in html
+    assert "No provider orders or fills are stored in these snapshots" in html
+    assert "Manual portfolio" in html and "Paper trades" in html
+    assert "snapshot rows do not create trades or ledger entries" in html
+    assert 'href="/page/stock-analysis"' in html and 'href="/page/finance"' in html
+    assert "initialDashboardStatus" in html and "data_status" in html
+
+
+def test_dashboard_shows_saved_goal_progress_and_finance_link(tmp_path, monkeypatch):
+    db, client = _client(tmp_path, monkeypatch)
+    from portfolio_tracker.finance_ops import create_goal, add_goal_contribution
+    goal_id = create_goal(db, {"name": "Emergency fund", "target_amount": "100000", "starting_amount": "10000", "monthly_contribution": "0", "currency": "INR"})
+    add_goal_contribution(db, goal_id, "9000", source="operator")
+    html = client.get("/").get_data(as_text=True)
+    assert "FINANCIAL GOALS" in html and "Emergency fund" in html
+    assert "10%" in html and "19000" in html and "100000" in html and "INR" in html

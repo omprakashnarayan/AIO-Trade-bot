@@ -86,6 +86,7 @@ def test_dashboard_rejects_legacy_horizontal_operator_navigation(tmp_path, monke
 def test_every_operator_workspace_uses_terminal_shell_and_controls(tmp_path, monkeypatch):
     client = auth_client(monkeypatch, Database(tmp_path / "console.sqlite3"))
     expected = {
+        "stock-analysis": ("STOCK ANALYSIS / EVIDENCE-GATED", "Run market_research"),
         "ledger": ("LEDGER / TAX SCOPE", "Preview import"),
         "agents": ("AGENT CONTROL PLANE", "Run now"),
         "trades": ("PAPER ORDER TICKET", "Submit paper order"),
@@ -95,7 +96,7 @@ def test_every_operator_workspace_uses_terminal_shell_and_controls(tmp_path, mon
         "audit": ("RISK CONTROL", "AUDIT EVENT STREAM"),
         "settings": ("OPERATOR SETTINGS", "Save settings"),
     }
-    expected_nav = [("/", "Portfolio"), ("/page/trades", "Trades"), ("/page/ledger", "Ledger / Tax"), ("/page/agents", "Agents"), ("/page/integrations", "Integrations"), ("/page/strategies", "Strategies"), ("/page/scheduler", "Scheduler"), ("/page/audit", "Risk / Audit"), ("/page/settings", "Settings")]
+    expected_nav = [("/", "Portfolio"), ("/page/stock-analysis", "Stock analysis"), ("/page/trades", "Trades"), ("/page/ledger", "Ledger / Tax"), ("/page/agents", "Agents"), ("/page/integrations", "Integrations"), ("/page/strategies", "Strategies"), ("/page/scheduler", "Scheduler"), ("/page/audit", "Risk / Audit"), ("/page/settings", "Settings")]
     pages = ["/"] + [f"/page/{section}" for section in expected]
     shells = []
     for path in pages:

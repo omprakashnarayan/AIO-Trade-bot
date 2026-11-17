@@ -21,5 +21,5 @@ def test_shared_operator_script_parses(tmp_path):
 
 
 def test_agent_toggle_uses_supported_method():
-    script = re.search(r"<script(?:\s[^>]*)?>(.*?)</script>", OPERATOR_PAGE_TEMPLATE, re.S).group(1)
+    script = "\n".join(re.findall(r"<script(?:\s[^>]*)?>(.*?)</script>", OPERATOR_PAGE_TEMPLATE, re.S))
     assert "action==='toggle'?'PUT':'POST'" in script

@@ -219,7 +219,7 @@ CREATE INDEX IF NOT EXISTS idx_benchmark_time ON benchmark_snapshots(benchmark, 
 CREATE TABLE IF NOT EXISTS research_evidence (
     id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, source_identifier TEXT NOT NULL,
     captured_at TEXT NOT NULL, provider TEXT NOT NULL, excerpt TEXT NOT NULL DEFAULT '', content_hash TEXT NOT NULL,
-    symbol TEXT NOT NULL DEFAULT '', topic TEXT NOT NULL DEFAULT '', verified INTEGER NOT NULL DEFAULT 1 CHECK (verified IN (0,1)),
+    symbol TEXT NOT NULL DEFAULT '', topic TEXT NOT NULL DEFAULT '', verified INTEGER NOT NULL DEFAULT 0 CHECK (verified IN (0,1)),
     created_at TEXT NOT NULL, UNIQUE(source, source_identifier, content_hash)
 );
 CREATE INDEX IF NOT EXISTS idx_research_evidence_scope ON research_evidence(symbol, topic, captured_at DESC);
@@ -1115,6 +1115,12 @@ class Database:
         with self.connect() as conn:
             conn.execute("INSERT INTO console_state(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at", (key, value, now))
 
+    def set_console_state_with_audit(self, key: str, value: str, *, event_type: str, entity_type: str, entity_id: str, payload: Any, broker_id: str | None = None, account_id: str | None = None, portfolio_id: str | None = None, mode: str | None = None) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self.connect() as conn:
+            conn.execute("INSERT INTO console_state(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at", (key, value, now))
+            self._append_audit_event_conn(conn, event_type, entity_type, entity_id, payload, broker_id, account_id, portfolio_id, mode, now)
+
     def list_agents(self) -> list[sqlite3.Row]:
         with self.connect() as conn:
             return conn.execute("SELECT a.*, r.id AS last_run_id, r.run_type AS last_run_type, r.status AS last_run_status, r.started_at AS last_run_started_at, r.finished_at AS last_run_finished_at FROM agents a LEFT JOIN agent_runs r ON r.id=(SELECT id FROM agent_runs WHERE agent_name=a.name ORDER BY id DESC LIMIT 1) ORDER BY a.name").fetchall()
@@ -1127,6 +1133,15 @@ class Database:
         with self.connect() as conn:
             cur = conn.execute("UPDATE agents SET enabled=?, updated_at=? WHERE name=?", (1 if enabled else 0, datetime.now(timezone.utc).isoformat(), name))
             return cur.rowcount == 1
+
+    def set_agent_enabled_with_audit(self, name: str, enabled: bool, *, event_type: str, entity_type: str, entity_id: str, payload: Any, broker_id: str | None = None, account_id: str | None = None, portfolio_id: str | None = None, mode: str | None = None) -> bool:
+        now = datetime.now(timezone.utc).isoformat()
+        with self.connect() as conn:
+            cur = conn.execute("UPDATE agents SET enabled=?, updated_at=? WHERE name=?", (1 if enabled else 0, now, name))
+            if cur.rowcount != 1:
+                return False
+            self._append_audit_event_conn(conn, event_type, entity_type, entity_id, payload, broker_id, account_id, portfolio_id, mode, now)
+            return True
 
     def create_agent_run(self, agent_name: str, *, run_type: str, started_at: str, retry_of: int | None = None) -> int:
         if run_type not in {"run", "test"}:
@@ -1160,12 +1175,18 @@ class Database:
             rows = conn.execute("SELECT id FROM agent_runs WHERE agent_name=? ORDER BY id DESC LIMIT ?", (name, limit)).fetchall()
         return [result for row in rows if (result := self.get_agent_run(int(row["id"]))) is not None]
 
-    def create_research_evidence(self, *, source: str, source_identifier: str, captured_at: str, provider: str, excerpt: str = "", content_hash: str, symbol: str = "", topic: str = "", verified: bool = True) -> int:
+    def create_research_evidence(self, *, source: str, source_identifier: str, captured_at: str, provider: str, excerpt: str = "", content_hash: str, symbol: str = "", topic: str = "", verified: bool = False) -> int:
+        if not isinstance(verified, bool):
+            raise ValueError("verified must be a boolean")
         now = datetime.now(timezone.utc).isoformat()
         with self.connect() as conn:
             cur = conn.execute("INSERT INTO research_evidence(source,source_identifier,captured_at,provider,excerpt,content_hash,symbol,topic,verified,created_at) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(source,source_identifier,content_hash) DO UPDATE SET captured_at=excluded.captured_at,provider=excluded.provider,excerpt=excluded.excerpt,symbol=excluded.symbol,topic=excluded.topic,verified=excluded.verified", (source, source_identifier, captured_at, provider, excerpt, content_hash, symbol.upper(), topic, 1 if verified else 0, now))
             row = conn.execute("SELECT id FROM research_evidence WHERE source=? AND source_identifier=? AND content_hash=?", (source, source_identifier, content_hash)).fetchone()
             return int(row["id"])
+
+    def get_research_evidence(self, evidence_id: int) -> sqlite3.Row | None:
+        with self.connect() as conn:
+            return conn.execute("SELECT * FROM research_evidence WHERE id=?", (evidence_id,)).fetchone()
 
     def list_research_evidence(self, *, symbol: str | None = None, topic: str | None = None, limit: int = 100) -> list[sqlite3.Row]:
         clauses, params = [], []

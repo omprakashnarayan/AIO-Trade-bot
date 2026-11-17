@@ -8,14 +8,29 @@ from typing import Any, Callable
 
 from .db import Database
 from .execution import ExecutionGateway, LiveModeRejected
+from .agents import AGENTS, run_agent
+from .config import load_settings, save_settings
 from .promotion_gates import PromotionGates
+from .risk import RiskEngine, RiskLimits
 from .trading_models import ExecutionMode, OrderIntent, OrderSide, OrderType, TimeInForce
 
-_SECRET = re.compile(r"(?i)(bearer\s+|token[=:]\s*|api[_-]?key[=:]\s*|secret[=:]\s*|password[=:]\s*)[^\s,;]+|sk-[A-Za-z0-9_-]+|ghp_[A-Za-z0-9]+")
+_SECRET = re.compile(r"(?i)(bearer\s+|token[=:]\s*|api[_-]?key[=:]\s*|[A-Za-z0-9_-]*secret[_-]?key[=:]\s*|secret[=:]\s*|password[=:]\s*)[^\s,;]+|sk-[A-Za-z0-9_-]+|ghp_[A-Za-z0-9]+")
+_SECRET_KEYS = {"token", "accesstoken", "refreshtoken", "apikey", "secret", "password", "authorization", "privatekey", "clientsecret"}
+
+def _secret_key(key: Any) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+    return normalized in _SECRET_KEYS or normalized.endswith(("token", "apikey", "secret", "secretkey", "password", "authorization"))
 
 def redact(value: Any) -> Any:
-    if isinstance(value, str): return _SECRET.sub(lambda m: m.group(1) + "[REDACTED]" if m.group(1) else "[REDACTED]", value)
-    if isinstance(value, dict): return {str(k): redact(v) for k, v in value.items()}
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            parsed = None
+        if isinstance(parsed, (dict, list)):
+            return json.dumps(redact(parsed), separators=(",", ":"))
+        return _SECRET.sub(lambda m: m.group(1) + "[REDACTED]" if m.group(1) else "[REDACTED]", value)
+    if isinstance(value, dict): return {str(k): "[REDACTED]" if _secret_key(k) else redact(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)): return [redact(v) for v in value]
     return value
 
@@ -27,13 +42,17 @@ TOOLS = [
     {"name":"holdings","description":"Scoped local holdings","inputSchema":{"type":"object","properties":{"portfolio":{"type":"string"}}},"annotations":{"readOnlyHint":True},"x-scope":"portfolio"},
     {"name":"ledger_tax_report","description":"Scoped ledger and tax rows","inputSchema":{"type":"object","properties":{"portfolio":{"type":"string"}}},"annotations":{"readOnlyHint":True},"x-scope":"portfolio"},
     {"name":"market_data_status","description":"Market data cache status","inputSchema":{"type":"object","properties":{}},"annotations":{"readOnlyHint":True},"x-scope":"global"},
-    {"name":"research_findings","description":"Stored research findings","inputSchema":{"type":"object","properties":{"symbol":{"type":"string"}}},"annotations":{"readOnlyHint":True},"x-scope":"portfolio"},
-    {"name":"finance_goals_alerts","description":"Scoped finance goals and alerts","inputSchema":{"type":"object","properties":{}},"annotations":{"readOnlyHint":True},"x-scope":"portfolio"},
+    {"name":"research_findings","description":"Global stored research findings; findings have no account or portfolio association","inputSchema":{"type":"object","properties":{"symbol":{"type":"string"}}},"annotations":{"readOnlyHint":True},"x-scope":"global"},
+    {"name":"finance_goals_alerts","description":"Finance goals and alerts scoped to the configured account and portfolio","inputSchema":{"type":"object","properties":{"account_id":{"type":"string"},"portfolio_id":{"type":"string"}}},"annotations":{"readOnlyHint":True},"x-scope":"portfolio"},
     {"name":"provider_integration_status","description":"Provider MCP capability states; no credentials returned","inputSchema":{"type":"object","properties":{}},"annotations":{"readOnlyHint":True},"x-scope":"global"},
     {"name":"provider_mcp_status","description":"MCP-only broker status and discovered read tools; no credentials","inputSchema":{"type":"object","properties":{}},"annotations":{"readOnlyHint":True},"x-scope":"global"},
     {"name":"provider_mcp_snapshot","description":"Verified persisted broker MCP snapshot, read-only","inputSchema":{"type":"object","required":["broker_id","account_id"],"properties":{"broker_id":{"type":"string"},"account_id":{"type":"string"}}},"annotations":{"readOnlyHint":True},"x-scope":"global"},
-    {"name":"paper_proposal_create","description":"Record a paper proposal (does not submit)","inputSchema":{"type":"object","required":["symbol","side","quantity"],"properties":{"symbol":{"type":"string"},"side":{"type":"string","enum":["buy","sell"]},"quantity":{"type":"string"},"portfolio_id":{"type":"string"},"account_id":{"type":"string"}}},"x-scope":"portfolio","x-capability":"paper"},
-    {"name":"paper_order_submit","description":"Submit a validated paper order through ExecutionGateway","inputSchema":{"type":"object","required":["idempotency_key","symbol","side","quantity","quote_price"],"properties":{"idempotency_key":{"type":"string"},"symbol":{"type":"string"},"side":{"type":"string","enum":["buy","sell"]},"quantity":{"type":"string"},"quote_price":{"type":"string"},"portfolio_id":{"type":"string"},"account_id":{"type":"string"},"order_type":{"type":"string","enum":["market","limit"]},"limit_price":{"type":"string"}}},"x-scope":"portfolio","x-capability":"paper","x-mutating":True},
+    {"name":"paper_proposal_create","description":"Record a paper proposal (does not submit)","inputSchema":{"type":"object","required":["symbol","side","quantity"],"properties":{"symbol":{"type":"string"},"side":{"type":"string","enum":["buy","sell"]},"quantity":{"type":"string"},"portfolio_id":{"type":"string"},"account_id":{"type":"string"}}},"annotations":{"readOnlyHint":False,"destructiveHint":False,"openWorldHint":False},"x-scope":"portfolio","x-capability":"paper","x-mutating":True},
+    {"name":"paper_order_submit","description":"Submit a validated market paper order through ExecutionGateway","inputSchema":{"type":"object","required":["idempotency_key","symbol","side","quantity","quote_price"],"properties":{"idempotency_key":{"type":"string"},"symbol":{"type":"string"},"side":{"type":"string","enum":["buy","sell"]},"quantity":{"type":"string"},"quote_price":{"type":"string"},"portfolio_id":{"type":"string"},"account_id":{"type":"string"},"order_type":{"type":"string","enum":["market"]}}},"annotations":{"readOnlyHint":False,"destructiveHint":False,"openWorldHint":False},"x-scope":"portfolio","x-capability":"paper","x-mutating":True},
+    {"name":"kill_switch_set","description":"Set the local paper-trading kill switch","inputSchema":{"type":"object","required":["state"],"properties":{"state":{"type":"string","enum":["on","off"]}}},"annotations":{"readOnlyHint":False,"destructiveHint":False,"openWorldHint":False},"x-scope":"global","x-mutating":True},
+    {"name":"scheduler_set_enabled","description":"Enable or disable the local scheduler without running it","inputSchema":{"type":"object","required":["enabled"],"properties":{"enabled":{"type":"boolean"}}},"annotations":{"readOnlyHint":False,"destructiveHint":False,"openWorldHint":False},"x-scope":"global","x-mutating":True},
+    {"name":"agent_set_enabled","description":"Enable or disable an allowlisted local agent","inputSchema":{"type":"object","required":["name","enabled"],"properties":{"name":{"type":"string","enum":[agent["name"] for agent in AGENTS]},"enabled":{"type":"boolean"}}},"annotations":{"readOnlyHint":False,"destructiveHint":False,"openWorldHint":False},"x-scope":"global","x-mutating":True},
+    {"name":"agent_run","description":"Run an enabled allowlisted local agent","inputSchema":{"type":"object","required":["name"],"properties":{"name":{"type":"string","enum":[agent["name"] for agent in AGENTS]},"run_type":{"type":"string","enum":["run","test"]}}},"annotations":{"readOnlyHint":False,"destructiveHint":False,"openWorldHint":False},"x-scope":"global","x-mutating":True},
     {"name":"promotion_gate_status","description":"Promotion gate checklist status","inputSchema":{"type":"object","properties":{}},"annotations":{"readOnlyHint":True},"x-scope":"global"},
 ]
 
@@ -42,12 +61,19 @@ class MCPServer:
     def _db(self):
         db = self.db_factory(); db.init_db(); return db
     def _scope(self, name, args):
-        for key in ("account_id", "portfolio_id", "portfolio"):
-            configured = os.environ.get("PORTFOLIO_MCP_" + key.upper())
-            if configured and args.get(key) and str(args[key]) != configured: raise PermissionError("requested namespace is outside MCP token scope")
-        if name in {"holdings", "portfolio_summary", "ledger_tax_report"} and not args.get("portfolio"):
-            configured = os.environ.get("PORTFOLIO_MCP_PORTFOLIO")
-            if configured: return {**args, "portfolio": configured}
+        settings = load_settings() if name in {"paper_order_submit", "paper_proposal_create", "finance_goals_alerts", "holdings", "portfolio_summary", "ledger_tax_report"} else {}
+        configured_account = os.environ.get("PORTFOLIO_MCP_ACCOUNT_ID") or settings.get("default_account_id") or None
+        configured_portfolio = (os.environ.get("PORTFOLIO_MCP_PORTFOLIO_ID") or os.environ.get("PORTFOLIO_MCP_PORTFOLIO") or settings.get("default_portfolio_id") or None)
+        if configured_account and args.get("account_id") and str(args["account_id"]) != configured_account:
+            raise PermissionError("requested namespace is outside MCP token scope")
+        for key in ("portfolio_id", "portfolio"):
+            if configured_portfolio and args.get(key) and str(args[key]) != configured_portfolio:
+                raise PermissionError("requested namespace is outside MCP token scope")
+        if name in {"paper_order_submit", "paper_proposal_create", "finance_goals_alerts"}:
+            return {**args, "account_id": args.get("account_id") or configured_account,
+                    "portfolio_id": args.get("portfolio_id") or args.get("portfolio") or configured_portfolio}
+        if name in {"holdings", "portfolio_summary", "ledger_tax_report"}:
+            return {**args, "portfolio": args.get("portfolio") or configured_portfolio}
         return args
     def call(self, name: str, args: dict[str, Any], actor: str = "mcp") -> Any:
         args = self._scope(name, args)
@@ -76,7 +102,12 @@ class MCPServer:
             return {"findings":_rows(rows)}
         if name == "finance_goals_alerts":
             with db.connect() as conn:
-                goals=conn.execute("SELECT * FROM finance_goals ORDER BY id DESC").fetchall(); alerts=conn.execute("SELECT * FROM alerts ORDER BY id DESC").fetchall()
+                clauses, params = [], []
+                for key in ("account_id", "portfolio_id"):
+                    if args.get(key): clauses.append(f"{key}=?"); params.append(args[key])
+                scope = " WHERE " + " AND ".join(clauses) if clauses else ""
+                goals=conn.execute("SELECT * FROM finance_goals" + scope + " ORDER BY id DESC", params).fetchall()
+                alerts=conn.execute("SELECT * FROM alerts" + scope + " ORDER BY id DESC", params).fetchall()
             return {"goals":_rows(goals),"alerts":_rows(alerts)}
         if name in {"provider_mcp_status", "provider_integration_status"}:
             with db.connect() as conn:
@@ -97,10 +128,50 @@ class MCPServer:
             db.append_audit_event(event_type="mcp.paper_proposal_created", entity_type="proposal", entity_id=str(args.get("symbol")), payload=payload, account_id=actor, mode="paper")
             return payload
         if name == "paper_order_submit":
-            intent = OrderIntent(idempotency_key=str(args["idempotency_key"]), portfolio_id=args.get("portfolio_id") or "Main", account_id=args.get("account_id"), symbol=str(args["symbol"]), side=OrderSide(args["side"]), order_type=OrderType(args.get("order_type","market")), time_in_force=TimeInForce.DAY, quantity=Decimal(str(args["quantity"])), currency=str(args.get("currency","INR")), mode=ExecutionMode.PAPER, limit_price=args.get("limit_price"))
-            result = ExecutionGateway(db).submit(intent, quote_price=Decimal(str(args["quote_price"])))
+            if args.get("order_type", "market") != "market" or "limit_price" in args:
+                raise ValueError("MCP paper orders support market orders only")
+            intent = OrderIntent(idempotency_key=str(args["idempotency_key"]), portfolio_id=args.get("portfolio_id"), account_id=args.get("account_id"), symbol=str(args["symbol"]), side=OrderSide(args["side"]), order_type=OrderType.MARKET, time_in_force=TimeInForce.DAY, quantity=Decimal(str(args["quantity"])), currency=str(args.get("currency","INR")), mode=ExecutionMode.PAPER)
+            settings = load_settings()
+            limits = RiskLimits(global_kill_switch=db.get_console_state("global_kill_switch", "off") == "on", max_order_notional=Decimal(str(settings["max_order_notional"])) if settings.get("max_order_notional") not in (None, "") else None, max_position_weight=Decimal(str(settings["max_position_weight"])) if settings.get("max_position_weight") not in (None, "") else None)
+            result = ExecutionGateway(db, risk=RiskEngine(limits=limits, db=db)).submit(intent, quote_price=Decimal(str(args["quote_price"])))
             db.append_audit_event(event_type="mcp.paper_order_called", entity_type="order_intent", entity_id=intent.idempotency_key, payload={"actor":actor,"status":result.status}, account_id=actor, portfolio_id=intent.portfolio_id, mode="paper")
             return {"status":result.status,"submitted":result.submitted,"error":result.error,"risk":result.risk.message}
+        if name == "kill_switch_set":
+            state = args.get("state")
+            if state not in {"on", "off"}: raise ValueError("state must be on or off")
+            db.set_console_state_with_audit("global_kill_switch", state, event_type="risk.kill_switch.changed", entity_type="risk", entity_id="global", payload={"state":state,"actor":actor}, account_id=actor, mode="paper")
+            return {"global_kill_switch":state == "on"}
+        if name == "scheduler_set_enabled":
+            enabled = args.get("enabled")
+            if not isinstance(enabled, bool): raise ValueError("enabled must be a boolean")
+            original_settings = load_settings()
+            settings = {**original_settings, "scheduler_enabled": enabled}
+            db.append_audit_event(event_type="scheduler.state.change_requested", entity_type="scheduler", entity_id="operator", payload={"enabled":enabled,"actor":actor}, account_id=actor, mode="paper")
+            try:
+                save_settings(settings)
+                db.append_audit_event(event_type="scheduler.state.changed", entity_type="scheduler", entity_id="operator", payload={"enabled":enabled,"actor":actor}, account_id=actor, mode="paper")
+            except Exception:
+                try:
+                    save_settings(original_settings)
+                except Exception:
+                    pass
+                raise
+            return {"enabled":enabled}
+        if name == "agent_set_enabled":
+            agent_name, enabled = args.get("name"), args.get("enabled")
+            if agent_name not in {item["name"] for item in AGENTS}: raise KeyError("unknown agent")
+            if not isinstance(enabled, bool): raise ValueError("enabled must be a boolean")
+            if not db.set_agent_enabled_with_audit(agent_name, enabled, event_type="mcp.agent.enabled", entity_type="agent", entity_id=agent_name, payload={"enabled":enabled,"actor":actor}, account_id=actor, mode="paper"):
+                raise KeyError("unknown agent")
+            return {"name":agent_name,"enabled":enabled}
+        if name == "agent_run":
+            agent_name = args.get("name")
+            if agent_name not in {item["name"] for item in AGENTS}: raise KeyError("unknown agent")
+            run_type = args.get("run_type", "run")
+            if run_type not in {"run", "test"}: raise ValueError("run_type must be run or test")
+            run = run_agent(db, agent_name, run_type=run_type)
+            db.append_audit_event(event_type="mcp.agent.run", entity_type="agent_run", entity_id=str(run["id"]), payload={"agent_name":agent_name,"status":run["status"],"run_type":run_type,"actor":actor}, account_id=actor, mode="paper")
+            return run
         raise KeyError("unknown tool")
     def rpc(self, request: dict[str, Any], actor: str = "mcp") -> dict[str, Any] | None:
         rid = request.get("id")
